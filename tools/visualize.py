@@ -162,7 +162,13 @@ def plot_progress(rows: list[dict], roofline: float, out_path: Path) -> None:
                 linewidth=1.4,
             )
 
-    ax1.axhline(roofline, linestyle="--", color="#1f1f1f", linewidth=1.4, label=f"derived ceiling {roofline:.3f} TFLOPS")
+    ax1.axhline(
+        roofline,
+        linestyle="--",
+        color="#1f1f1f",
+        linewidth=1.4,
+        label=f"derived ceiling {roofline:.3f} TFLOPS",
+    )
     ax1.set_xlabel("experiment ordinal")
     ax1.set_ylabel("throughput (TFLOPS)")
     ax1.set_title("throughput timeline by experiment")
@@ -204,6 +210,13 @@ def main() -> None:
     rows = read_rows(args.input)
     if args.kernel:
         rows = [row for row in rows if row["kernel"] == args.kernel]
+    else:
+        kernels = sorted({row["kernel"] if row["kernel"] else "<unknown>" for row in rows})
+        if len(kernels) > 1:
+            raise SystemExit(
+                f"multiple kernels detected: {', '.join(kernels)}. "
+                "Use --kernel <name>."
+            )
 
     if not rows:
         raise SystemExit("no rows with throughput found for selected filter")
