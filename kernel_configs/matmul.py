@@ -12,8 +12,14 @@ from ._utils import dtype_bytes
 def input_generator(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
     torch.manual_seed(seed)
     M, N, K = size["M"], size["N"], size["K"]
-    a = torch.randn(M, K, device=device, dtype=dtype)
-    b = torch.randn(K, N, device=device, dtype=dtype)
+    # Normalize by K**-0.25 so each output element ~ N(0, 1) regardless of K. Without this,
+    # outputs grow ~sqrt(K) and a fixed atol becomes ill-posed: at large K, two *correct* matmuls
+    # (kernel vs cuBLAS) differ in fp32-accumulation order by amounts visible at fp16 resolution.
+    # Normalizing keeps the correctness tolerance meaningful and K-independent. (Generate in fp32
+    # then cast so the scale doesn't lose precision in low-dtype.)
+    scale = K ** -0.25
+    a = (torch.randn(M, K, device=device, dtype=torch.float32) * scale).to(dtype)
+    b = (torch.randn(K, N, device=device, dtype=torch.float32) * scale).to(dtype)
     return {"a": a, "b": b}
 
 

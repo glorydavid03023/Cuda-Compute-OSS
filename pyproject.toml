@@ -1,7 +1,7 @@
 [project]
 name = "cuda-compute-oss"
 version = "0.1.0"
-description = "Autonomous GPU kernel optimization system driven by AI agents"
+description = "GPU kernel optimization competition harness for gittensor subnet 74 (CCO)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,6 +22,13 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The repo is a set of top-level packages + run-in-place scripts, not a single
+# `cuda_compute_oss/` package, so hatchling must be told explicitly what to ship.
+# Without this, `uv run`/`uv sync` fail with "Unable to determine which files to
+# ship inside the wheel" on every platform.
+[tool.hatch.build.targets.wheel]
+packages = ["cco", "kernel_configs", "kernels", "references", "tools"]
 
 [tool.ruff]
 line-length = 120

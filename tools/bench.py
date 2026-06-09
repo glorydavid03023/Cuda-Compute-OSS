@@ -188,6 +188,10 @@ _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
     "4080":       (305.0,  716.8,  64.0),
     "3090":       (142.0,  936.2,  6.0),
     "3080":       (119.5,  760.3,  5.0),
+    # Blackwell GeForce (RTX 50xx). fp16/L2 here are approximate and feed only the %-peak
+    # DISPLAY, never the scored speedup ratio; the 5070 Ti's 896 GB/s bandwidth is exact.
+    # The canonical competition SKU's real peaks get pinned in runtime/gpu.config (Step 16).
+    "5070 Ti":    (177.0,  896.0,  48.0),
     "B200":       (2250.0, 8000.0, 64.0),
     "B100":       (1800.0, 8000.0, 64.0),
 }
@@ -214,9 +218,11 @@ def detect_gpu() -> GPUSpec:
         peak_fp16, peak_bw, l2 = matched
     else:
         ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
-        clock_ghz = props.clock_rate / 1e6
+        # torch >= 2.8 may not expose props.clock_rate; degrade gracefully instead of crashing.
+        clock_khz = getattr(props, "clock_rate", 0) or 0
+        clock_ghz = (clock_khz / 1e6) if clock_khz else 1.5  # GHz; fall back to a typical boost clock
         peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3
-        peak_bw = max(props.clock_rate / 1e6 * 256 / 8 * 2, 500.0)
+        peak_bw = max(clock_ghz * 256 / 8 * 2, 500.0)
         l2 = props.L2_cache_size / (1024 * 1024) if hasattr(props, "L2_cache_size") else 0.0
 
     peak_bf16 = peak_fp16

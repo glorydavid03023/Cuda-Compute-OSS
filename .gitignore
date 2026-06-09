@@ -16,8 +16,12 @@ run.log
 *.ncu-rep
 *.nsys-rep
 *.sqlite
-*.csv 
+*.csv
 *.json
+# ...but DO track the CCO competition config files (anchored to repo root):
+!/cco.config.json
+!/payload-schema.json
+!/manifest.json
 
 LOCAL.md
 design-overview.md

@@ -51,9 +51,12 @@ rtol = 1e-2
 atol = 2e-2
 rtol = 2e-2
 
+# Inputs are normalized (scaled by K**-0.25) so outputs are O(1) for every K, keeping tolerances
+# K-independent. fp32 still uses tf32x3 ("ieee") in Triton (not bit-true fp32), so a small margin
+# over 1e-4 is kept. fp32 is correctness coverage only — fp16 is the competition's performance axis.
 [tolerances.float32]
-atol = 1e-4
-rtol = 1e-4
+atol = 1e-3
+rtol = 1e-3
 
 [[edge_sizes]]
 label = "edge_1023"
