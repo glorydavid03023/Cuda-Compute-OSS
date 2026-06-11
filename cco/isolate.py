@@ -191,7 +191,9 @@ def _repo_root() -> str:
 
 def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                  n_blocks: int = 30, warmup: int = 25, rep: int = 100,
-                 n_val: int = 6, quick: bool = False, timeout_s: float = 1200.0) -> dict:
+                 n_val: int = 6, quick: bool = False, timeout_s: float = 1200.0,
+                 peak_bw_gb_s: float = 0.0, peak_tflops: float = 0.0,
+                 floor_fraction: float = 0.8) -> dict:
     """Score `kernel_path` isolated; judge correctness HERE against the oracle over the full suite.
 
     `compare_fn(output, expected, atol, rtol, multi_output) -> {"match": bool, "max_abs_error": ..}`
@@ -345,7 +347,9 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                     if not cmp["match"]:
                         stage_ok["determinism"] = False
 
-        # scored-size correctness (the timed inputs were validated too)
+        # scored-size correctness on the pre/post-timing buffers. NOTE: the per-iteration TIMED-LOOP
+        # outputs are not individually oracle-checked (they are the same buffers); the absolute
+        # roofline floor below is what makes the timed *speed* unforgeable.
         scored_ok = True
         sval = res.get("scored_val") or []
         if len(sval) < n_val:
@@ -367,12 +371,28 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
 
         latencies_us = list(res.get("event_block_us") or [])
         timed_wall_s = float(res.get("timed_wall_s") or 0.0)
-        # Anchor the cuda-event sample's SCALE to the child's forge-resistant captured-clock wall of
-        # the SAME loop. Events (now read from a captured torch.cuda.Event the kernel can't repatch)
-        # measure GPU-only; wall includes per-call launch overhead, so honest timing has
-        # event_median <= wall_per_iter. A kernel under-reporting its events (e.g. side-stream
-        # evasion that the full-device sync still waits on) shows event_median << wall_per_iter.
+
+        # ABSOLUTE roofline floor (the load-bearing speed-forge defense): a CORRECT kernel must move
+        # the required bytes and do the required FLOPs, so it cannot beat
+        #   max(bytes/peak_bw, flops/peak_flops).
+        # A median below that is physically impossible — memoize-and-replay, cached/early return, or
+        # side-stream under-report — and is rejected regardless of HOW it cheats. floor_fraction (<1)
+        # keeps a slightly-underestimated peak from false-rejecting a near-peak honest kernel.
+        floor_us = 0.0
+        if peak_bw_gb_s and peak_tflops and config.get("bytes_fn") and config.get("flops_fn"):
+            try:
+                nbytes = config["bytes_fn"](scored_size, dtypes[0])
+                nflops = config["flops_fn"](scored_size)
+                mem_us = nbytes / (peak_bw_gb_s * 1e9) * 1e6
+                cmp_us = nflops / (peak_tflops * 1e12) * 1e6
+                floor_us = max(mem_us, cmp_us) * floor_fraction
+            except Exception:
+                floor_us = 0.0
+
+        # Also anchor the event sample's SCALE to the child's captured-clock wall of the same loop
+        # (catches side-stream evasion the full-device sync still waits on).
         timing_inconsistent = False
+        below_floor = False
         if latencies_us:
             event_med_us = statistics.median(latencies_us)
             denom = n_blocks * rep
@@ -381,6 +401,9 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                 timing_inconsistent = True
             if wall_per_iter_us > 0 and event_med_us < wall_per_iter_us / 4.0:  # scale anchor
                 timing_inconsistent = True
+            if floor_us > 0 and event_med_us < floor_us:              # absolute roofline floor
+                below_floor = True
+                timing_inconsistent = True
         if timing_inconsistent:
             overall = False
             stages["correctness"] = "FAIL"
@@ -388,7 +411,7 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         return {
             **base, "correct": bool(overall and scored_ok), "max_abs_error": worst_err,
             "delegation": None, "timing_inconsistent": timing_inconsistent, "child_wall_s": child_wall_s,
-            "timed_wall_s": timed_wall_s,
+            "timed_wall_s": timed_wall_s, "roofline_floor_us": floor_us, "below_floor": below_floor,
             "child_error": res.get("child_error"), "stages": stages, "latencies_us": latencies_us,
             "median_us": statistics.median(latencies_us) if latencies_us else 0.0,
             "mean_us": statistics.fmean(latencies_us) if latencies_us else 0.0,
@@ -506,6 +529,33 @@ def kernel_fn(x, weight, eps=1e-6):
     return _triton(x, weight, eps)
 '''
 
+# Correct on every validated buffer (cache hits return the real cached output), but the timed loop is
+# ~all near-free dict lookups -> a physically-impossible median. The roofline floor must reject it.
+_MEMOIZE = '''
+import torch, triton, triton.language as tl
+KERNEL_TYPE = "rms_norm"
+_cache = {}
+_refs = []
+@triton.jit
+def _k(X, W, Y, s, N, eps, B: tl.constexpr):
+    row = tl.program_id(0); cols = tl.arange(0, B); m = cols < N
+    x = tl.load(X + row*s + cols, mask=m, other=0.0).to(tl.float32)
+    rms = tl.sqrt(tl.sum(x*x)/N + eps)
+    w = tl.load(W + cols, mask=m, other=0.0).to(tl.float32)
+    tl.store(Y + row*s + cols, (x/rms*w), mask=m)
+def _real(x, weight, eps):
+    M, N = x.shape; y = torch.empty_like(x)
+    _k[(M,)](x, weight, y, x.stride(0), N, eps, B=triton.next_power_of_2(N))
+    return y
+def kernel_fn(x, weight, eps=1e-6):
+    key = (x.data_ptr(), weight.data_ptr())
+    c = _cache.get(key)
+    if c is not None:
+        return c
+    _refs.append(x); _refs.append(weight)   # pin so the address can't be recycled
+    y = _real(x, weight, eps); _cache[key] = y; return y
+'''
+
 
 def _self_test() -> int:
     import torch
@@ -533,7 +583,9 @@ def _self_test() -> int:
               "test_dtypes": [torch.float16],
               "tolerances": {torch.float16: {"atol": 1e-2, "rtol": 1e-2}},
               "test_sizes": [("small", {"M": 256, "N": 768}), ("large", {"M": 1024, "N": 4096})],
-              "edge_sizes": [("edge", {"M": 257, "N": 768})]}
+              "edge_sizes": [("edge", {"M": 257, "N": 768})],
+              "flops_fn": lambda s: 6 * s["M"] * s["N"],
+              "bytes_fn": lambda s, dt: (2 * s["M"] * s["N"] + s["N"]) * 2}
 
     import shutil
     failures = 0
@@ -544,7 +596,8 @@ def _self_test() -> int:
         with open(kp, "w") as f:
             f.write(src)
         try:
-            return run_isolated(kp, config, seed=123456, compare_fn=_cmp, n_blocks=5, rep=20, n_val=4)
+            return run_isolated(kp, config, seed=123456, compare_fn=_cmp, n_blocks=5, rep=20, n_val=4,
+                                peak_bw_gb_s=1000.0, peak_tflops=100.0)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -576,6 +629,11 @@ def _self_test() -> int:
     r = run(_TIMED_DELEGATOR)
     check(not r["correct"] and bool(r.get("delegation")),
           "delegate-only-inside-the-timed-loop -> CAUGHT (timed loop is now trapped)")
+
+    r = run(_MEMOIZE)
+    check(not r["correct"] and bool(r.get("below_floor")),
+          "memoize-and-replay -> REJECTED by the roofline floor "
+          f"(median {r['median_us']:.2f}us < floor {r.get('roofline_floor_us', 0):.2f}us)")
 
     print("-" * 60)
     print("SELF-TEST PASSED" if not failures else f"SELF-TEST FAILED: {failures} case(s)")
