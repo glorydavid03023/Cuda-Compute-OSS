@@ -64,6 +64,8 @@ DENY_QUALIFIED_NAMES = frozenset({
     "torch._scaled_mm", "torch._int_mm", "torch._weight_int4pack_mm", "torch._weight_int8pack_mm",
     # JIT-compiling the kernel = delegating kernel generation (Inductor can emit a cuBLAS/CUTLASS GEMM)
     "torch.compile",
+    # pickle-backed file R/W that walks past the `open` ban (arbitrary host file read/write + unpickle)
+    "torch.load", "torch.save",
     # CUDA stream / event / graph manipulation — a Triton kernel launches on the current (timed) stream
     # and needs none of these; allowing them lets a correct kernel move its real work onto a SIDE stream
     # so the timed CUDA events under-report (the full-device sync still waits, so it stays correct but
@@ -125,6 +127,9 @@ DENY_METHODS = frozenset({
     "softmax", "log_softmax", "scaled_dot_product_attention",
     # (2) string-keyed attribute / format dispatch
     "attrgetter", "methodcaller", "itemgetter", "format", "format_map",
+    # (3) import-loader methods (file R/W + code exec via a module's __loader__, no open/exec needed)
+    "load_module", "exec_module", "get_data", "set_data", "source_to_code", "get_code",
+    "get_source", "create_module", "get_filename", "get_resource_reader", "_cache_bytecode",
 })
 
 # The subset of DENY_METHODS that is string-keyed dispatch (presentation only — drives a clearer
@@ -180,6 +185,12 @@ DENY_DUNDER_ATTRS = frozenset({
     "sys", "_sys", "builtins", "bltns", "inspect", "modules", "__import__",
     "get_objects", "get_referrers", "get_referents", "_current_frames", "_getframe",
     "getouterframes", "currentframe", "import_module",
+    # (4) IMPORT-MACHINERY leaves. Every module exposes a live loader/spec: `mod.__loader__` is a
+    #     SourceFileLoader whose set_data/exec_module/get_data give file-write / code-exec / file-read
+    #     with NO open/exec/__import__ (full RCE). Ban the loader/spec/file dunder gateways (the spec's
+    #     sub-attrs like .loader/.origin are reachable only THROUGH __spec__, already covered). (Stopgap:
+    #     type(mod) can rebuild a loader class without __loader__ — durable fix is the sandboxed child.)
+    "__loader__", "__spec__", "__file__", "__path__", "__package__", "__cached__",
 })
 
 # Imports are an ALLOWLIST, not a denylist (a denylist always lags a new GEMM library). A submission
@@ -321,6 +332,33 @@ def _build_alias_map(tree: ast.AST) -> dict:
             for a in node.names:
                 bound = a.asname or a.name
                 aliases[bound] = f"{module}.{a.name}" if module else a.name
+
+    # ASSIGNMENT ALIASES: a one-line rebind `cu = torch.cuda` / `t = torch` / `pd = torch.utils.
+    # _python_dispatch` makes `cu.Stream()` / `t._scaled_mm()` resolve to a bare unknown name and slip the
+    # qualified-name/prefix denylist. Resolve any `Name = <dotted Name/Attribute>` (RHS a pure attribute
+    # chain, no call/subscript) against the current map and bind the LHS. A fixpoint handles chains
+    # (`nn = torch.nn; F = nn.functional`). Flow-insensitive + conservative — fine for a default-reject
+    # guard (over-binding at worst over-flags a name a kernel reused, which is vanishingly rare).
+    assigns = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            parts = _dotted_parts(node.value)
+            if parts and len(parts) >= 1:
+                assigns.append((node.targets[0].id, parts))
+        elif (isinstance(node, ast.AnnAssign) and node.value is not None
+              and isinstance(node.target, ast.Name)):
+            parts = _dotted_parts(node.value)
+            if parts and len(parts) >= 1:
+                assigns.append((node.target.id, parts))
+    for _ in range(len(assigns) + 1):                      # fixpoint for alias chains
+        changed = False
+        for name, parts in assigns:
+            resolved = _resolve(parts, aliases)
+            if resolved != name and aliases.get(name) != resolved:  # ignore self-bindings (x = x.attr)
+                aliases[name] = resolved
+                changed = True
+        if not changed:
+            break
     return aliases
 
 
@@ -388,6 +426,13 @@ class _Scanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node):
+        self._record_def(node)
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node):
+        # A decorator on a CLASS is an arbitrary callable run at class-def time; `_record_def` was only
+        # invoked for functions, so a bare denied-qualified decorator (`@torch.compile` / `@torch.jit.
+        # script` on a class) slipped the scan. Check class decorators the same way.
         self._record_def(node)
         self.generic_visit(node)
 
@@ -816,6 +861,33 @@ _NEGATIVE_CASES = [
      ("import torch\nimport dataclasses\ndef kernel_fn(a, b):\n"
       "    return dataclasses.inspect.currentframe()\n"),
      "dynamic-dispatch"),
+    ("loader RCE: warnings.__loader__.get_data (file read via import machinery, no open)",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    return warnings.__loader__.get_data(warnings.__file__)\n"),
+     "dynamic-dispatch"),
+    ("loader RCE: warnings.__loader__.set_data (arbitrary file WRITE)",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    warnings.__loader__.set_data('/tmp/x', b'y')\n    return a + b\n"),
+     "dynamic-dispatch"),
+    ("H1 bare denied decorator on a CLASS: @torch.compile",
+     ("import torch\n@torch.compile\nclass _C:\n    pass\ndef kernel_fn(a, b):\n    return a + b\n"),
+     "delegation"),
+    ("H1 @torch.jit.script on a class (prefix-denied decorator)",
+     ("import torch\n@torch.jit.script\nclass _D:\n    pass\ndef kernel_fn(a, b):\n    return a + b\n"),
+     "delegation"),
+    ("H2 assignment-alias: cu = torch.cuda; cu.Stream() (side-stream via rebind)",
+     ("import torch\ndef kernel_fn(a, b):\n    cu = torch.cuda\n    s = cu.Stream()\n    return a + b\n"),
+     "delegation"),
+    ("H2 assignment-alias: t = torch; t._scaled_mm(...) (fp8 GEMM via rebind)",
+     ("import torch\ndef kernel_fn(a, b):\n    t = torch\n    return t._scaled_mm(a, b, a, b)\n"),
+     "delegation"),
+    ("H2 chained alias: nn = torch.nn; F = nn.functional; F.rms_norm(...)",
+     ("import torch\ndef kernel_fn(a, b):\n    nn = torch.nn\n    F = nn.functional\n"
+      "    return F.rms_norm(a, (a.shape[-1],))\n"),
+     "delegation"),
+    ("M1 torch.load arbitrary file read + unpickle",
+     ("import torch\ndef kernel_fn(a, b):\n    return torch.load('p.pt', weights_only=False)\n"),
+     "delegation"),
 ]
 
 

@@ -33,6 +33,7 @@
         "torch.rms_norm", "torch.layer_norm", "torch.group_norm", "torch.silu", "torch.glu",
         "torch._scaled_mm", "torch._int_mm", "torch._weight_int4pack_mm", "torch._weight_int8pack_mm",
         "torch.compile",
+        "torch.load", "torch.save",
         "torch.cuda.Stream", "torch.cuda.ExternalStream", "torch.cuda.stream", "torch.cuda.StreamContext",
         "torch.cuda.set_stream", "torch.cuda.current_stream", "torch.cuda.default_stream",
         "torch.cuda.Event", "torch.cuda.graph", "torch.cuda.CUDAGraph",
@@ -55,7 +56,9 @@
       "deny_methods": [
         "matmul", "mm", "bmm", "addmm", "baddbmm", "addbmm", "einsum", "tensordot",
         "softmax", "log_softmax", "scaled_dot_product_attention",
-        "attrgetter", "methodcaller", "itemgetter", "format", "format_map"
+        "attrgetter", "methodcaller", "itemgetter", "format", "format_map",
+        "load_module", "exec_module", "get_data", "set_data", "source_to_code", "get_code",
+        "get_source", "create_module", "get_filename", "get_resource_reader", "_cache_bytecode"
       ],
       "deny_builtins": [
         "eval", "exec", "compile", "__import__", "getattr", "setattr", "globals", "vars", "open",
@@ -70,7 +73,8 @@
         "__code__", "__closure__", "cell_contents",
         "sys", "_sys", "builtins", "bltns", "inspect", "modules", "__import__",
         "get_objects", "get_referrers", "get_referents", "_current_frames", "_getframe",
-        "getouterframes", "currentframe", "import_module"
+        "getouterframes", "currentframe", "import_module",
+        "__loader__", "__spec__", "__file__", "__path__", "__package__", "__cached__"
       ],
       "_import_policy": "ALLOWLIST: a submission may import ONLY these top-level modules; everything else (escapes + alternate GPU-compute libraries that could matmul outside torch's interposed view) is rejected.",
       "allow_import_modules": [
