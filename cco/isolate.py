@@ -216,6 +216,7 @@ def _child_main(job_path: str, out_path: str) -> int:
     det_outputs = []
     scored_val = []
     event_block_us: list[float] = []
+    wall_block_us: list[float] = []     # PRIMARY: per-block synced captured-clock wall (forge-resistant)
     timed_wall_s = 0.0
     two_point_us = 0.0
     probe_in_gpu: list = []   # captured (input, output) of a parent-chosen, kernel-unknowable sample
@@ -314,6 +315,7 @@ def _child_main(job_path: str, out_path: str) -> int:
             _t0 = _perf()
             for blk in range(n_blk):
                 _verify()                          # between blocks: catch a kernel that popped the trap
+                _wb0 = _perf()                     # GPU idle here (prior block's _sync / the warmup _sync)
                 s.record()
                 for r in range(rep):
                     bi = g % ntb
@@ -327,10 +329,15 @@ def _child_main(job_path: str, out_path: str) -> int:
                         probe_out_gpu.append(clone_gpu(out))
                     g += 1
                 e.record()
-                _sync()
-                # EVERY block feeds the median (probe positions are scattered across all blocks and
-                # unknowable to the kernel), so a kernel cannot garbage a median-feeding call without
-                # risking the oracle probe. The few async clones at probe positions are negligible.
+                _sync()                            # full-device sync -> the per-block WALL below is exact
+                # PRIMARY latency = the per-block captured-clock WALL (Phase B): the full-device sync makes
+                # it count ANY work moved off the default stream, so a side-stream/split-K kernel cannot
+                # under-report it the way it can the default-stream cuda EVENTS. `_perf` lives in this
+                # (main) thread; the worker-thread kernel cannot patch it (it cannot import time, frame-walk
+                # to this thread, or gc-reach this local). EVERY block feeds the median, and probe positions
+                # are scattered across all blocks + unknowable to the kernel. The cuda-event time is kept
+                # only as a SANITY cross-check (it must not exceed the wall), never as the score.
+                wall_block_us.append((_perf() - _wb0) / rep * 1e6)
                 event_block_us.append(s.elapsed_time(e) * 1000.0 / rep)
             timed_wall_s = _perf() - _t0
 
@@ -386,11 +393,12 @@ def _child_main(job_path: str, out_path: str) -> int:
             _wt.join(timeout=5)
 
     if delegation is not None:
-        det_outputs, scored_val, event_block_us = [], [], []
+        det_outputs, scored_val, event_block_us, wall_block_us = [], [], [], []
         probe_inputs, probe_outputs = [], []
 
     torch.save({"task_outputs": task_outputs, "det_outputs": det_outputs,
                 "scored_val": scored_val, "event_block_us": event_block_us,
+                "wall_block_us": wall_block_us,
                 "timed_wall_s": timed_wall_s, "two_point_us": two_point_us, "delegation": delegation,
                 "probe_inputs": probe_inputs, "probe_outputs": probe_outputs,
                 "child_error": child_error}, out_path)
@@ -726,15 +734,24 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         overall = all(stage_ok[k] for k in stage_ok if stage_seen[k]) and scored_ok and probe_ok
         stages["correctness"] = "PASS" if overall else "FAIL"
 
-        latencies_us = list(res.get("event_block_us") or [])
+        # PHASE B — the PRIMARY latency is the per-block synced captured-clock WALL, NOT the default-stream
+        # cuda events. The full-device sync makes the wall count ANY work the kernel moves off the default
+        # stream, so a side-stream / split-K kernel that under-reports its events gains nothing: the wall
+        # is the score and it stays honest. The events are kept only as a sanity bound (they are a subset
+        # of the wall and cannot exceed it). `_perf` is captured in the child's main thread before the
+        # kernel loads and is unreachable from the worker-thread kernel (no time import, no frame-walk
+        # across threads, no gc reach), so the wall cannot be patched.
+        wall_lat = list(res.get("wall_block_us") or [])
+        event_lat = list(res.get("event_block_us") or [])
+        latencies_us = wall_lat if wall_lat else event_lat            # wall PRIMARY; event is the fallback
         timed_wall_s = float(res.get("timed_wall_s") or 0.0)
 
-        # ABSOLUTE roofline floor (the load-bearing speed-forge defense): a CORRECT kernel must move
-        # the required bytes and do the required FLOPs, so it cannot beat
-        #   max(bytes/peak_bw, flops/peak_flops).
-        # A median below that is physically impossible — memoize-and-replay, cached/early return, or
-        # side-stream under-report — and is rejected regardless of HOW it cheats. floor_fraction (<1)
-        # keeps a slightly-underestimated peak from false-rejecting a near-peak honest kernel.
+        # ABSOLUTE roofline floor (load-bearing speed-forge defense): a correct kernel must move the
+        # required bytes / do the required FLOPs, so its GPU time cannot beat max(bytes/peak_bw,
+        # flops/peak_flops). The floor is checked against the GPU-only EVENT time (the quantity the
+        # hardware actually bounds); a value below it is physically impossible — memoize/cached/early
+        # return, or default-stream-empty side-stream evasion — and is rejected. floor_fraction (<1)
+        # absorbs a slightly-underestimated peak so a near-peak honest kernel is not false-rejected.
         floor_us = 0.0
         if peak_bw_gb_s and peak_tflops and config.get("bytes_fn") and config.get("flops_fn"):
             try:
@@ -746,35 +763,22 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             except Exception:
                 floor_us = 0.0
 
-        # Also anchor the event sample's SCALE to the child's captured-clock wall of the same loop
-        # (catches side-stream evasion the full-device sync still waits on).
         timing_inconsistent = False
         below_floor = False
         if latencies_us:
-            event_med_us = statistics.median(latencies_us)
-            denom = n_blocks * rep
-            wall_per_iter_us = (timed_wall_s / denom * 1e6) if denom else 0.0
-            two_point_us = float(res.get("two_point_us") or 0.0)
-            if sum(latencies_us) * rep / 1e6 > child_wall_s:          # outer backstop (claimed GPU > wall)
+            med_us = statistics.median(latencies_us)                 # the WALL median = the score
+            event_med_us = statistics.median(event_lat) if event_lat else med_us
+            # (1) outer backstop: total claimed GPU time cannot exceed the child's own measured wall.
+            if event_lat and sum(event_lat) * rep / 1e6 > child_wall_s:
                 timing_inconsistent = True
-            # TWO-POINT WALL ANCHOR — the durable, name-independent side-stream defense. The child's
-            # two-point figure (wall of 2x kernel calls minus wall of 1x, captured-clock + full-device
-            # synced) is the REAL per-call GPU cost INCLUDING any work moved to a side stream that the
-            # default-stream cuda events miss. So an event median far below it is a timing under-report
-            # (side stream under ANY qualified name, or patched events) — caught WITHOUT enumerating the
-            # stream API. Because the kernel runs in a worker thread it cannot reach _perf, the events, or
-            # the schedule, so both numbers are honest. The two-point also carries the per-call mutation +
-            # thread-handoff overhead, so the honest event/two-point ratio is < 1 (MEASURED ~0.7-0.95);
-            # the 0.5 threshold stays below that honest floor so it never false-rejects a real kernel,
-            # while a side-stream offload drives the ratio toward 0. (wall_per_iter is the fallback when a
-            # two-point sample is unavailable.)
-            if two_point_us > 0:
-                if event_med_us < two_point_us * 0.5:
-                    timing_inconsistent = True
-            elif wall_per_iter_us > 0 and event_med_us < wall_per_iter_us * 0.5:
-                timing_inconsistent = True
-            if floor_us > 0 and event_med_us < floor_us:              # absolute roofline floor
+            # (2) absolute roofline floor on the GPU-only event time (catches memoize / cached / a
+            #     near-zero default-stream that did its real work off-stream).
+            if floor_us > 0 and event_med_us < floor_us:
                 below_floor = True
+                timing_inconsistent = True
+            # (3) sanity: the GPU-only event time is a SUBSET of the full synced wall and cannot
+            #     materially exceed it; a large excess means forged/inconsistent timing.
+            if wall_lat and event_lat and event_med_us > med_us * 1.5:
                 timing_inconsistent = True
         if timing_inconsistent:
             overall = False
@@ -784,6 +788,7 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             **base, "correct": bool(overall and scored_ok and probe_ok), "max_abs_error": worst_err,
             "delegation": None, "timing_inconsistent": timing_inconsistent, "child_wall_s": child_wall_s,
             "timed_wall_s": timed_wall_s, "two_point_us": float(res.get("two_point_us") or 0.0),
+            "event_med_us": (statistics.median(event_lat) if event_lat else 0.0),  # sanity cross-check only
             "roofline_floor_us": floor_us, "below_floor": below_floor,
             "probe_ok": probe_ok, "n_probes": len(pout),
             "child_error": res.get("child_error"), "stages": stages, "latencies_us": latencies_us,
