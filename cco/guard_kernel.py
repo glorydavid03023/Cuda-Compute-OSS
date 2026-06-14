@@ -64,6 +64,8 @@ DENY_QUALIFIED_NAMES = frozenset({
     "torch._scaled_mm", "torch._int_mm", "torch._weight_int4pack_mm", "torch._weight_int8pack_mm",
     # JIT-compiling the kernel = delegating kernel generation (Inductor can emit a cuBLAS/CUTLASS GEMM)
     "torch.compile",
+    # pickle-backed file R/W that walks past the `open` ban (arbitrary host file read/write + unpickle)
+    "torch.load", "torch.save",
     # CUDA stream / event / graph manipulation — a Triton kernel launches on the current (timed) stream
     # and needs none of these; allowing them lets a correct kernel move its real work onto a SIDE stream
     # so the timed CUDA events under-report (the full-device sync still waits, so it stays correct but
@@ -125,6 +127,9 @@ DENY_METHODS = frozenset({
     "softmax", "log_softmax", "scaled_dot_product_attention",
     # (2) string-keyed attribute / format dispatch
     "attrgetter", "methodcaller", "itemgetter", "format", "format_map",
+    # (3) import-loader methods (file R/W + code exec via a module's __loader__, no open/exec needed)
+    "load_module", "exec_module", "get_data", "set_data", "source_to_code", "get_code",
+    "get_source", "create_module", "get_filename", "get_resource_reader", "_cache_bytecode",
 })
 
 # The subset of DENY_METHODS that is string-keyed dispatch (presentation only — drives a clearer
@@ -139,6 +144,11 @@ DENY_BUILTINS = frozenset({
     # string-keyed attribute/method dispatch (the `operator` module is itself import-banned below; these
     # also catch the bare `from operator import attrgetter` -> `attrgetter(...)` call form for good measure)
     "attrgetter", "methodcaller", "itemgetter",
+    # In an exec_module-loaded submission, the bare name `__builtins__` is the FULL builtins dict, so
+    # `__builtins__["__import__"]("os")` / `__builtins__["eval"](...)` resurrect every banned builtin. It
+    # is a deny_dunder_attr (so `x.__builtins__` is caught) but visit_Name only checks deny_builtins —
+    # so ban the bare Name here too.
+    "__builtins__",
 })
 
 # Introspection ATTRIBUTES that defeat a name-based scan by reaching state the kernel must not touch.
@@ -162,6 +172,25 @@ DENY_DUNDER_ATTRS = frozenset({
     "f_back", "f_locals", "f_globals", "f_builtins", "f_code", "f_trace",
     "gi_frame", "cr_frame", "ag_frame", "gi_code", "cr_code",
     "__code__", "__closure__", "cell_contents",
+    # (3) MODULE re-export / introspection leaves. Allowlisted stdlib modules re-export the REAL
+    #     sys / inspect / builtins / gc as plain attributes (`warnings.sys`, `dataclasses.sys`,
+    #     `dataclasses.inspect`, `enum.bltns`, `collections._sys`, `typing.sys`, …), and the scanner's
+    #     dotted-name resolver is severed by a subscript — so `warnings.sys.modules["os"].system(...)`
+    #     (RCE on the scoring host) and `mod.sys.modules["builtins"].__import__("gc").get_objects()`
+    #     (heap-walk that steals the probe schedule ACROSS the thread boundary — gc is process-global)
+    #     both passed clean. Ban the gateway leaves: the re-export module names, the sys.modules/builtins
+    #     dict gateways, and the gc/inspect frame-and-heap walkers. (NB: this is a stopgap on a denylist
+    #     that cannot be complete against shared-interpreter Python — the durable fix is to run the
+    #     untrusted kernel in a SEPARATE, sandboxed OS process whose memory holds no secret. See DESIGN.)
+    "sys", "_sys", "builtins", "bltns", "inspect", "modules", "__import__",
+    "get_objects", "get_referrers", "get_referents", "_current_frames", "_getframe",
+    "getouterframes", "currentframe", "import_module",
+    # (4) IMPORT-MACHINERY leaves. Every module exposes a live loader/spec: `mod.__loader__` is a
+    #     SourceFileLoader whose set_data/exec_module/get_data give file-write / code-exec / file-read
+    #     with NO open/exec/__import__ (full RCE). Ban the loader/spec/file dunder gateways (the spec's
+    #     sub-attrs like .loader/.origin are reachable only THROUGH __spec__, already covered). (Stopgap:
+    #     type(mod) can rebuild a loader class without __loader__ — durable fix is the sandboxed child.)
+    "__loader__", "__spec__", "__file__", "__path__", "__package__", "__cached__",
 })
 
 # Imports are an ALLOWLIST, not a denylist (a denylist always lags a new GEMM library). A submission
@@ -303,6 +332,33 @@ def _build_alias_map(tree: ast.AST) -> dict:
             for a in node.names:
                 bound = a.asname or a.name
                 aliases[bound] = f"{module}.{a.name}" if module else a.name
+
+    # ASSIGNMENT ALIASES: a one-line rebind `cu = torch.cuda` / `t = torch` / `pd = torch.utils.
+    # _python_dispatch` makes `cu.Stream()` / `t._scaled_mm()` resolve to a bare unknown name and slip the
+    # qualified-name/prefix denylist. Resolve any `Name = <dotted Name/Attribute>` (RHS a pure attribute
+    # chain, no call/subscript) against the current map and bind the LHS. A fixpoint handles chains
+    # (`nn = torch.nn; F = nn.functional`). Flow-insensitive + conservative — fine for a default-reject
+    # guard (over-binding at worst over-flags a name a kernel reused, which is vanishingly rare).
+    assigns = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            parts = _dotted_parts(node.value)
+            if parts and len(parts) >= 1:
+                assigns.append((node.targets[0].id, parts))
+        elif (isinstance(node, ast.AnnAssign) and node.value is not None
+              and isinstance(node.target, ast.Name)):
+            parts = _dotted_parts(node.value)
+            if parts and len(parts) >= 1:
+                assigns.append((node.target.id, parts))
+    for _ in range(len(assigns) + 1):                      # fixpoint for alias chains
+        changed = False
+        for name, parts in assigns:
+            resolved = _resolve(parts, aliases)
+            if resolved != name and aliases.get(name) != resolved:  # ignore self-bindings (x = x.attr)
+                aliases[name] = resolved
+                changed = True
+        if not changed:
+            break
     return aliases
 
 
@@ -370,6 +426,13 @@ class _Scanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node):
+        self._record_def(node)
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node):
+        # A decorator on a CLASS is an arbitrary callable run at class-def time; `_record_def` was only
+        # invoked for functions, so a bare denied-qualified decorator (`@torch.compile` / `@torch.jit.
+        # script` on a class) slipped the scan. Check class decorators the same way.
         self._record_def(node)
         self.generic_visit(node)
 
@@ -776,6 +839,54 @@ _NEGATIVE_CASES = [
      "delegation"),
     ("top-level torch.Stream alias",
      "import torch\ndef kernel_fn(a, b):\n    s = torch.Stream()\n    return a + b\n",
+     "delegation"),
+    ("RCE via re-exported sys: warnings.sys.modules['os'].system(...)",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    warnings.sys.modules['os'].system('echo PWNED')\n    return a + b\n"),
+     "dynamic-dispatch"),
+    ("RCE via dataclasses.sys.modules['subprocess']",
+     ("import torch\nimport dataclasses\ndef kernel_fn(a, b):\n"
+      "    dataclasses.sys.modules['subprocess'].run(['echo', 'pwn'])\n    return a + b\n"),
+     "dynamic-dispatch"),
+    ("bare __builtins__ dict resurrects banned builtins",
+     ("import torch\ndef kernel_fn(a, b):\n"
+      "    return __builtins__['__import__']('os').system('x')\n"),
+     "dynamic-dispatch"),
+    ("gc heap-walk steals the probe schedule across the thread boundary",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    g = warnings.sys.modules['builtins'].__import__('gc')\n"
+      "    return a + b if g.get_objects() else a\n"),
+     "dynamic-dispatch"),
+    ("inspect re-export frame walk: dataclasses.inspect.currentframe()",
+     ("import torch\nimport dataclasses\ndef kernel_fn(a, b):\n"
+      "    return dataclasses.inspect.currentframe()\n"),
+     "dynamic-dispatch"),
+    ("loader RCE: warnings.__loader__.get_data (file read via import machinery, no open)",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    return warnings.__loader__.get_data(warnings.__file__)\n"),
+     "dynamic-dispatch"),
+    ("loader RCE: warnings.__loader__.set_data (arbitrary file WRITE)",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    warnings.__loader__.set_data('/tmp/x', b'y')\n    return a + b\n"),
+     "dynamic-dispatch"),
+    ("H1 bare denied decorator on a CLASS: @torch.compile",
+     ("import torch\n@torch.compile\nclass _C:\n    pass\ndef kernel_fn(a, b):\n    return a + b\n"),
+     "delegation"),
+    ("H1 @torch.jit.script on a class (prefix-denied decorator)",
+     ("import torch\n@torch.jit.script\nclass _D:\n    pass\ndef kernel_fn(a, b):\n    return a + b\n"),
+     "delegation"),
+    ("H2 assignment-alias: cu = torch.cuda; cu.Stream() (side-stream via rebind)",
+     ("import torch\ndef kernel_fn(a, b):\n    cu = torch.cuda\n    s = cu.Stream()\n    return a + b\n"),
+     "delegation"),
+    ("H2 assignment-alias: t = torch; t._scaled_mm(...) (fp8 GEMM via rebind)",
+     ("import torch\ndef kernel_fn(a, b):\n    t = torch\n    return t._scaled_mm(a, b, a, b)\n"),
+     "delegation"),
+    ("H2 chained alias: nn = torch.nn; F = nn.functional; F.rms_norm(...)",
+     ("import torch\ndef kernel_fn(a, b):\n    nn = torch.nn\n    F = nn.functional\n"
+      "    return F.rms_norm(a, (a.shape[-1],))\n"),
+     "delegation"),
+    ("M1 torch.load arbitrary file read + unpickle",
+     ("import torch\ndef kernel_fn(a, b):\n    return torch.load('p.pt', weights_only=False)\n"),
      "delegation"),
 ]
 

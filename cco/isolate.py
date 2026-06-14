@@ -216,6 +216,7 @@ def _child_main(job_path: str, out_path: str) -> int:
     det_outputs = []
     scored_val = []
     event_block_us: list[float] = []
+    wall_block_us: list[float] = []     # PRIMARY: per-block synced captured-clock wall (forge-resistant)
     timed_wall_s = 0.0
     two_point_us = 0.0
     probe_in_gpu: list = []   # captured (input, output) of a parent-chosen, kernel-unknowable sample
@@ -265,18 +266,20 @@ def _child_main(job_path: str, out_path: str) -> int:
             n_blk = int(sc["n_blocks"])
             tbufs = [cuda_in(b) for b in sc["timed_buffers"]]       # separate storage: mutated while timing
             ntb = len(tbufs)
-            mut_key = sc["mut_key"]
+            mut_keys = sc.get("mut_keys") or ([sc["mut_key"]] if sc.get("mut_key") else [])
+            mut_secret = int(sc.get("mut_secret", 0))
             probe_set = {tuple(p) for p in (sc.get("probe_positions") or [])}   # server-random (block, rep)
 
             # Per-call input mutation via a tiny TRITON store, NOT a torch op: a torch setitem would be
             # intercepted by the delegation trap (~tens of us of Python per call) and make the CPU, not
             # the kernel, the bottleneck for fast kernels. A Triton launch bypasses the torch dispatcher
-            # — the trap never sees it — and the destination views are built once, outside the trap. It
-            # writes a MONOTONICALLY growing value to element 0 before every timed call: the value at a
-            # captured (late) call is therefore far from the value at the buffer's first touch, so a
-            # pointer-cache that replays its first-touch output is stale in row 0 by a wide margin —
-            # detectable at ANY track tolerance — while a content-cache must recompute (honest timing).
-            # Element 0 (vs a rotating index) keeps the store a single un-specialized Triton kernel.
+            # — the trap never sees it — and the destination views are built once, outside the trap.
+            # A2: the value written to element 0 is a KEYED hash of the call index (`gi*K + secret mod
+            # 60000`, bijective over [0,60000) so every call's input is still UNIQUE -> a content-cache
+            # always misses and a pointer-cache goes stale-detectable), NOT a monotone counter — so a
+            # kernel reading element 0 learns no ordinal it could gate work on. The secret lives only in
+            # this (main) thread; the kernel runs in the worker thread and cannot reach it. Bounded < fp16
+            # max. A3: written to EVERY float input (not just the largest), so no input can be ignored.
             import triton
             import triton.language as tl
 
@@ -284,13 +287,16 @@ def _child_main(job_path: str, out_path: str) -> int:
             def _mut_k(PTR, VAL):
                 tl.store(PTR, VAL)
 
-            _flats = [tb[mut_key].view(-1) for tb in tbufs]
-            _do_mut = (bool(_flats) and hasattr(tbufs[0].get(mut_key), "is_floating_point")
-                       and tbufs[0][mut_key].is_floating_point())
+            _flats = {key: [tb[key].view(-1) for tb in tbufs] for key in mut_keys
+                      if all(key in tb and hasattr(tb[key], "is_floating_point")
+                             and tb[key].is_floating_point() for tb in tbufs)}
+            _do_mut = bool(_flats)
 
-            def mutate(buf_idx, gi):                                # 1 Triton launch, no trapped torch op
-                if _do_mut:                                        # 37 + gi: monotonic, bounded < fp16 max
-                    _mut_k[(1,)](_flats[buf_idx], float(37 + gi % 60000))
+            def mutate(buf_idx, gi):                                # 1 Triton launch per float input
+                if _do_mut:
+                    val = float(37 + ((gi * 2654435761 + mut_secret) % 60000))
+                    for flats in _flats.values():
+                        _mut_k[(1,)](flats[buf_idx], val)
 
             g = 0                                                   # global timed-call index
             # The submission runs in the WORKER thread (via _call); the trap rides with it there
@@ -309,6 +315,7 @@ def _child_main(job_path: str, out_path: str) -> int:
             _t0 = _perf()
             for blk in range(n_blk):
                 _verify()                          # between blocks: catch a kernel that popped the trap
+                _wb0 = _perf()                     # GPU idle here (prior block's _sync / the warmup _sync)
                 s.record()
                 for r in range(rep):
                     bi = g % ntb
@@ -322,10 +329,15 @@ def _child_main(job_path: str, out_path: str) -> int:
                         probe_out_gpu.append(clone_gpu(out))
                     g += 1
                 e.record()
-                _sync()
-                # EVERY block feeds the median (probe positions are scattered across all blocks and
-                # unknowable to the kernel), so a kernel cannot garbage a median-feeding call without
-                # risking the oracle probe. The few async clones at probe positions are negligible.
+                _sync()                            # full-device sync -> the per-block WALL below is exact
+                # PRIMARY latency = the per-block captured-clock WALL (Phase B): the full-device sync makes
+                # it count ANY work moved off the default stream, so a side-stream/split-K kernel cannot
+                # under-report it the way it can the default-stream cuda EVENTS. `_perf` lives in this
+                # (main) thread; the worker-thread kernel cannot patch it (it cannot import time, frame-walk
+                # to this thread, or gc-reach this local). EVERY block feeds the median, and probe positions
+                # are scattered across all blocks + unknowable to the kernel. The cuda-event time is kept
+                # only as a SANITY cross-check (it must not exceed the wall), never as the score.
+                wall_block_us.append((_perf() - _wb0) / rep * 1e6)
                 event_block_us.append(s.elapsed_time(e) * 1000.0 / rep)
             timed_wall_s = _perf() - _t0
 
@@ -381,11 +393,12 @@ def _child_main(job_path: str, out_path: str) -> int:
             _wt.join(timeout=5)
 
     if delegation is not None:
-        det_outputs, scored_val, event_block_us = [], [], []
+        det_outputs, scored_val, event_block_us, wall_block_us = [], [], [], []
         probe_inputs, probe_outputs = [], []
 
     torch.save({"task_outputs": task_outputs, "det_outputs": det_outputs,
                 "scored_val": scored_val, "event_block_us": event_block_us,
+                "wall_block_us": wall_block_us,
                 "timed_wall_s": timed_wall_s, "two_point_us": two_point_us, "delegation": delegation,
                 "probe_inputs": probe_inputs, "probe_outputs": probe_outputs,
                 "child_error": child_error}, out_path)
@@ -399,6 +412,27 @@ def _child_main(job_path: str, out_path: str) -> int:
 
 def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _sandbox_wrap(cmd: list, scratch_dir: str) -> list:
+    """Phase D — wrap the untrusted-kernel child in an OS sandbox for RCE / filesystem / network
+    containment (NOT GPU isolation: CUDA needs writable /dev/nvidia*, so a kernel can still raw-ioctl the
+    device — GPU-side confidentiality comes from no-secret-in-child, not the jail).
+
+    OPT-IN: set $CCO_SANDBOX to an executable that runs `<scratch_dir> <argv...>` under the jail (the
+    repo ships runtime/sandbox.sh, a bubblewrap profile that binds only `scratch_dir` writable, mounts
+    the root read-only, drops the network + caps, and keeps /dev/nvidia*). When unset — the dev box / WSL2
+    has no bubblewrap — the child runs UNSANDBOXED, which is sound: the load-bearing anti-cheat (parent
+    oracle + forge-resistant wall + no-secret-in-child) holds regardless; the sandbox only contains a
+    kernel that reaches RCE through some not-yet-closed in-process escape. The trusted Linux scoring host
+    sets CCO_SANDBOX (see runtime/start.sh) after validating the profile on that host."""
+    wrapper = os.environ.get("CCO_SANDBOX")
+    if wrapper and os.path.isfile(wrapper) and os.access(wrapper, os.X_OK):
+        return [wrapper, scratch_dir, *cmd]
+    if wrapper:
+        sys.stderr.write(f"cco: CCO_SANDBOX={wrapper!r} is not an executable file — running child "
+                         f"UNSANDBOXED (set it to runtime/sandbox.sh on the trusted host)\n")
+    return cmd
 
 
 def _preload_so() -> "str | None":
@@ -478,6 +512,15 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
     edge_sizes = config.get("edge_sizes", [])
     dev = "cuda"
 
+    # A1 — SERVER-SIDE ENTROPY on the input seed. The `seed` passed in is PR-HEAD-derived (a miner can
+    # recompute it via cco/seed.py, locally memorize that seed's inputs->outputs, then push the same SHA).
+    # Salt it with fresh scoring-time entropy so the actual inputs are UNPREDICTABLE: a memorized table
+    # misses and the kernel must really compute. Timing stays comparable (these kernels' latency is size-
+    # not value-dependent) and the parent computes the oracle on the ACTUAL inputs, so correctness holds.
+    # The PR-HEAD SHA remains only as reproducibility metadata, never the live input source.
+    import secrets as _secrets
+    seed = (int(seed) ^ _secrets.randbits(62)) & 0x3FFFFFFFFFFFFFFF
+
     def tol_for(dt):
         return tols.get(dt, {"atol": 1e-2, "rtol": 1e-2})
 
@@ -537,16 +580,15 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
     scored_cpu = [{k: (v.detach().to("cpu") if hasattr(v, "detach") else v) for k, v in b.items()}
                   for b in scored_bufs]
 
-    # TIMED buffers — separate storage; the child mutates one element before every timed call so a
-    # cache cannot make the median sub-real. The largest float input is the mutation target (the
-    # output depends on it; a cache that ignores it returns a stale, oracle-detectable output).
-    def _largest_float_key(d):
-        best, bn = None, -1
-        for k, v in d.items():
-            if hasattr(v, "is_floating_point") and v.is_floating_point() and v.numel() > bn:
-                best, bn = k, v.numel()
-        return best
-    mut_key = _largest_float_key(scored_cpu[0])
+    # TIMED buffers — separate storage; the child mutates one element of EVERY float input before each
+    # timed call so a cache cannot make the median sub-real. A3 — mutate ALL float inputs, not just the
+    # largest: for `kernel_fn(big_weight, small_x)` the variable feature map is the SMALLER input, so a
+    # pointer-cache keyed on the unchanged big weight would otherwise pass the probe. The output depends
+    # on each input; a cache that ignores any of them returns a stale, oracle-detectable output.
+    def _float_keys(d):
+        return [k for k, v in d.items()
+                if hasattr(v, "is_floating_point") and v.is_floating_point() and v.numel() > 0]
+    mut_keys = _float_keys(scored_cpu[0])
     timed_bufs = [gen_fn(scored_size, dtypes[0], dev, seed=seed + 2000 + i) for i in range(max(1, n_timed))]
     timed_cpu = [{k: (v.detach().to("cpu") if hasattr(v, "detach") else v) for k, v in b.items()}
                  for b in timed_bufs]
@@ -556,7 +598,6 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
     # deleted from the child before the kernel loads (job.pt removed; `open` is statically banned), so
     # a schedule-aware kernel cannot tell which calls are checked and must be correct on EVERY timed
     # call — garbaging any one risks the probe. This closes the predictable-schedule crown-steal.
-    import secrets as _secrets
     _srng = random.Random(_secrets.randbits(128))
     total_timed = n_blocks * rep
     # Sample enough positions that even a kernel garbaging BLINDLY (it cannot read the schedule — the
@@ -580,7 +621,8 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                     "determinism": determinism,
                     "scored": {"buffers": scored_cpu, "n_pre": n_val // 2,
                                "warmup": warmup, "n_blocks": n_blocks, "rep": rep,
-                               "timed_buffers": timed_cpu, "mut_key": mut_key,
+                               "timed_buffers": timed_cpu, "mut_keys": mut_keys,
+                               "mut_secret": _secrets.randbits(31),
                                "probe_positions": probe_positions}}, job_path)
 
         # Import torch FIRST (the real one from site-packages) and APPEND the repo root rather than
@@ -605,6 +647,7 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             env["CCO_DELEGATION_LOG"] = deleg_flag
             env["LD_BIND_NOW"] = "1"                      # eager binding (belt-and-suspenders)
         cmd = [sys.executable, "-E", "-c", boot, job_path, out_path]
+        cmd = _sandbox_wrap(cmd, tmp)                 # Phase D: jail the untrusted child (opt-in; host only)
 
         t0 = time.perf_counter()
         proc = subprocess.run(cmd, cwd=tmp, env=env, capture_output=True, text=True, timeout=timeout_s)
@@ -631,7 +674,28 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                     "stages": fail_stages, "latencies_us": [], "median_us": 0.0, "mean_us": 0.0,
                     "stdev_us": 0.0, "child_wall_s": child_wall_s}
 
+        # Phase C — IPC hardening: the untrusted child wrote out.pt. Refuse to read it if it is a SYMLINK
+        # or not a regular file (a child with code-exec could repoint it at a host file / device), and
+        # require it to live inside our private 0700 tmp dir.
+        if (os.path.islink(out_path) or not os.path.isfile(out_path)
+                or os.path.realpath(os.path.dirname(out_path)) != os.path.realpath(tmp)):
+            return {**base, "correct": False, "max_abs_error": 0.0, "delegation": None,
+                    "error": "child output path is not a regular file in the private temp dir (IPC tamper)",
+                    "stages": fail_stages, "latencies_us": [], "median_us": 0.0, "mean_us": 0.0,
+                    "stdev_us": 0.0, "child_wall_s": child_wall_s}
+
         res = torch.load(out_path, weights_only=True)  # untrusted child output: tensors only (no pickle-RCE)
+        # Schema-integrity check: a tampered/garbage blob must be rejected, not silently scored. The
+        # timing vectors must be number lists no longer than the requested block count.
+        if not isinstance(res, dict) or not all(
+                isinstance(res.get(_k, []), list)
+                and len(res.get(_k, [])) <= n_blocks
+                and all(isinstance(_x, (int, float)) for _x in res.get(_k, []))
+                for _k in ("event_block_us", "wall_block_us")):
+            return {**base, "correct": False, "max_abs_error": 0.0, "delegation": None,
+                    "error": "child output failed schema-integrity check",
+                    "stages": fail_stages, "latencies_us": [], "median_us": 0.0, "mean_us": 0.0,
+                    "stdev_us": 0.0, "child_wall_s": child_wall_s}
         delegation = res.get("delegation")
         if delegation:
             return {**base, "correct": False, "max_abs_error": 0.0, "delegation": delegation,
@@ -713,15 +777,24 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         overall = all(stage_ok[k] for k in stage_ok if stage_seen[k]) and scored_ok and probe_ok
         stages["correctness"] = "PASS" if overall else "FAIL"
 
-        latencies_us = list(res.get("event_block_us") or [])
+        # PHASE B — the PRIMARY latency is the per-block synced captured-clock WALL, NOT the default-stream
+        # cuda events. The full-device sync makes the wall count ANY work the kernel moves off the default
+        # stream, so a side-stream / split-K kernel that under-reports its events gains nothing: the wall
+        # is the score and it stays honest. The events are kept only as a sanity bound (they are a subset
+        # of the wall and cannot exceed it). `_perf` is captured in the child's main thread before the
+        # kernel loads and is unreachable from the worker-thread kernel (no time import, no frame-walk
+        # across threads, no gc reach), so the wall cannot be patched.
+        wall_lat = list(res.get("wall_block_us") or [])
+        event_lat = list(res.get("event_block_us") or [])
+        latencies_us = wall_lat if wall_lat else event_lat            # wall PRIMARY; event is the fallback
         timed_wall_s = float(res.get("timed_wall_s") or 0.0)
 
-        # ABSOLUTE roofline floor (the load-bearing speed-forge defense): a CORRECT kernel must move
-        # the required bytes and do the required FLOPs, so it cannot beat
-        #   max(bytes/peak_bw, flops/peak_flops).
-        # A median below that is physically impossible — memoize-and-replay, cached/early return, or
-        # side-stream under-report — and is rejected regardless of HOW it cheats. floor_fraction (<1)
-        # keeps a slightly-underestimated peak from false-rejecting a near-peak honest kernel.
+        # ABSOLUTE roofline floor (load-bearing speed-forge defense): a correct kernel must move the
+        # required bytes / do the required FLOPs, so its GPU time cannot beat max(bytes/peak_bw,
+        # flops/peak_flops). The floor is checked against the GPU-only EVENT time (the quantity the
+        # hardware actually bounds); a value below it is physically impossible — memoize/cached/early
+        # return, or default-stream-empty side-stream evasion — and is rejected. floor_fraction (<1)
+        # absorbs a slightly-underestimated peak so a near-peak honest kernel is not false-rejected.
         floor_us = 0.0
         if peak_bw_gb_s and peak_tflops and config.get("bytes_fn") and config.get("flops_fn"):
             try:
@@ -733,35 +806,22 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             except Exception:
                 floor_us = 0.0
 
-        # Also anchor the event sample's SCALE to the child's captured-clock wall of the same loop
-        # (catches side-stream evasion the full-device sync still waits on).
         timing_inconsistent = False
         below_floor = False
         if latencies_us:
-            event_med_us = statistics.median(latencies_us)
-            denom = n_blocks * rep
-            wall_per_iter_us = (timed_wall_s / denom * 1e6) if denom else 0.0
-            two_point_us = float(res.get("two_point_us") or 0.0)
-            if sum(latencies_us) * rep / 1e6 > child_wall_s:          # outer backstop (claimed GPU > wall)
+            med_us = statistics.median(latencies_us)                 # the WALL median = the score
+            event_med_us = statistics.median(event_lat) if event_lat else med_us
+            # (1) outer backstop: total claimed GPU time cannot exceed the child's own measured wall.
+            if event_lat and sum(event_lat) * rep / 1e6 > child_wall_s:
                 timing_inconsistent = True
-            # TWO-POINT WALL ANCHOR — the durable, name-independent side-stream defense. The child's
-            # two-point figure (wall of 2x kernel calls minus wall of 1x, captured-clock + full-device
-            # synced) is the REAL per-call GPU cost INCLUDING any work moved to a side stream that the
-            # default-stream cuda events miss. So an event median far below it is a timing under-report
-            # (side stream under ANY qualified name, or patched events) — caught WITHOUT enumerating the
-            # stream API. Because the kernel runs in a worker thread it cannot reach _perf, the events, or
-            # the schedule, so both numbers are honest. The two-point also carries the per-call mutation +
-            # thread-handoff overhead, so the honest event/two-point ratio is < 1 (MEASURED ~0.7-0.95);
-            # the 0.5 threshold stays below that honest floor so it never false-rejects a real kernel,
-            # while a side-stream offload drives the ratio toward 0. (wall_per_iter is the fallback when a
-            # two-point sample is unavailable.)
-            if two_point_us > 0:
-                if event_med_us < two_point_us * 0.5:
-                    timing_inconsistent = True
-            elif wall_per_iter_us > 0 and event_med_us < wall_per_iter_us * 0.5:
-                timing_inconsistent = True
-            if floor_us > 0 and event_med_us < floor_us:              # absolute roofline floor
+            # (2) absolute roofline floor on the GPU-only event time (catches memoize / cached / a
+            #     near-zero default-stream that did its real work off-stream).
+            if floor_us > 0 and event_med_us < floor_us:
                 below_floor = True
+                timing_inconsistent = True
+            # (3) sanity: the GPU-only event time is a SUBSET of the full synced wall and cannot
+            #     materially exceed it; a large excess means forged/inconsistent timing.
+            if wall_lat and event_lat and event_med_us > med_us * 1.5:
                 timing_inconsistent = True
         if timing_inconsistent:
             overall = False
@@ -771,6 +831,7 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             **base, "correct": bool(overall and scored_ok and probe_ok), "max_abs_error": worst_err,
             "delegation": None, "timing_inconsistent": timing_inconsistent, "child_wall_s": child_wall_s,
             "timed_wall_s": timed_wall_s, "two_point_us": float(res.get("two_point_us") or 0.0),
+            "event_med_us": (statistics.median(event_lat) if event_lat else 0.0),  # sanity cross-check only
             "roofline_floor_us": floor_us, "below_floor": below_floor,
             "probe_ok": probe_ok, "n_probes": len(pout),
             "child_error": res.get("child_error"), "stages": stages, "latencies_us": latencies_us,
