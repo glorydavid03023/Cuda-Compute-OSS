@@ -686,12 +686,17 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
 
         res = torch.load(out_path, weights_only=True)  # untrusted child output: tensors only (no pickle-RCE)
         # Schema-integrity check: a tampered/garbage blob must be rejected, not silently scored. The
-        # timing vectors must be number lists no longer than the requested block count.
-        if not isinstance(res, dict) or not all(
-                isinstance(res.get(_k, []), list)
-                and len(res.get(_k, [])) <= n_blocks
-                and all(isinstance(_x, (int, float)) for _x in res.get(_k, []))
-                for _k in ("event_block_us", "wall_block_us")):
+        # timing vectors must be number lists no longer than the requested block count, AND the wall and
+        # event vectors must be the SAME length (the timed loop appends both in lockstep per block). The
+        # latter is load-bearing: the score is the wall vector but the probe/floor read the event vector,
+        # so an asymmetric blob (wall populated, event empty — reachable only if the per-block
+        # `s.elapsed_time(e)` raises after the wall is appended) would skip the probe; equal-length rejects
+        # it here. (Belt-and-suspenders: the probe and floor below also gate on the score vector.)
+        _ev, _wl = res.get("event_block_us", []), res.get("wall_block_us", [])
+        if not isinstance(res, dict) or len(_ev) != len(_wl) or not all(
+                isinstance(_v, list) and len(_v) <= n_blocks
+                and all(isinstance(_x, (int, float)) for _x in _v)
+                for _v in (_ev, _wl)):
             return {**base, "correct": False, "max_abs_error": 0.0, "delegation": None,
                     "error": "child output failed schema-integrity check",
                     "stages": fail_stages, "latencies_us": [], "median_us": 0.0, "mean_us": 0.0,
@@ -757,7 +762,10 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         probe_ok = True
         pin = res.get("probe_inputs") or []
         pout = res.get("probe_outputs") or []
-        if probe_positions and res.get("event_block_us"):     # probes were requested and timing ran
+        # Gate on the SCORE vector (wall), not the demoted event vector: a blob that scores on a populated
+        # wall must face the probe even if its event vector were empty. (`_wl`/`_ev` are also length-checked
+        # equal above, so this is belt-and-suspenders.)
+        if probe_positions and (_wl or _ev):                  # probes were requested and timing ran
             if len(pout) < len(probe_positions):
                 probe_ok = False
             for pi, po in zip(pin, pout):

@@ -301,9 +301,14 @@ def _dotted_parts(node: ast.AST):
     """
     parts = []
     cur = node
-    while isinstance(cur, ast.Attribute):
-        parts.append(cur.attr)
-        cur = cur.value
+    while True:
+        if isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        elif isinstance(cur, ast.NamedExpr):   # see through a walrus: `(x := torch.cuda).Stream` -> torch.cuda.Stream
+            cur = cur.value
+        else:
+            break
     if isinstance(cur, ast.Name):
         parts.append(cur.id)
         parts.reverse()
@@ -340,16 +345,34 @@ def _build_alias_map(tree: ast.AST) -> dict:
     # (`nn = torch.nn; F = nn.functional`). Flow-insensitive + conservative — fine for a default-reject
     # guard (over-binding at worst over-flags a name a kernel reused, which is vanishingly rare).
     assigns = []
+
+    def _bind(name, value):                                # value is an AST node; bind if it's a dotted chain
+        parts = _dotted_parts(value)
+        if parts:
+            assigns.append((name, parts))
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            parts = _dotted_parts(node.value)
-            if parts and len(parts) >= 1:
-                assigns.append((node.targets[0].id, parts))
-        elif (isinstance(node, ast.AnnAssign) and node.value is not None
-              and isinstance(node.target, ast.Name)):
-            parts = _dotted_parts(node.value)
-            if parts and len(parts) >= 1:
-                assigns.append((node.target.id, parts))
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    _bind(tgt.id, node.value)
+                elif (isinstance(tgt, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List))
+                      and len(tgt.elts) == len(node.value.elts)):     # `t, cu = torch, torch.cuda`
+                    for te, ve in zip(tgt.elts, node.value.elts):
+                        if isinstance(te, ast.Name):
+                            _bind(te.id, ve)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
+            _bind(node.target.id, node.value)
+        elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):  # walrus `(cu:=torch.cuda)`
+            _bind(node.target.id, node.value)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = node.args                                  # default args `def f(mm=torch._scaled_mm)` / lambda
+            pos = list(getattr(a, "posonlyargs", [])) + list(a.args)
+            for arg, dflt in zip(pos[len(pos) - len(a.defaults):], a.defaults) if a.defaults else []:
+                _bind(arg.arg, dflt)
+            for arg, dflt in zip(a.kwonlyargs, a.kw_defaults):
+                if dflt is not None:
+                    _bind(arg.arg, dflt)
     for _ in range(len(assigns) + 1):                      # fixpoint for alias chains
         changed = False
         for name, parts in assigns:
@@ -887,6 +910,19 @@ _NEGATIVE_CASES = [
      "delegation"),
     ("M1 torch.load arbitrary file read + unpickle",
      ("import torch\ndef kernel_fn(a, b):\n    return torch.load('p.pt', weights_only=False)\n"),
+     "delegation"),
+    ("H2 tuple-unpack alias: t, cu = torch, torch.cuda; cu.Stream()",
+     ("import torch\ndef kernel_fn(a, b):\n    t, cu = torch, torch.cuda\n    return cu.Stream()\n"),
+     "delegation"),
+    ("H2 walrus alias: (cu := torch.cuda).Stream()",
+     ("import torch\ndef kernel_fn(a, b):\n    return (cu := torch.cuda).Stream()\n"),
+     "delegation"),
+    ("H2 function-default alias: def _g(mm=torch._scaled_mm)",
+     ("import torch\ndef _g(a, b, mm=torch._scaled_mm):\n    return mm(a, b, a, b)\n"
+      "def kernel_fn(a, b):\n    return _g(a, b)\n"),
+     "delegation"),
+    ("H2 lambda-default alias: lambda cu=torch.cuda: cu.Stream()",
+     ("import torch\ndef kernel_fn(a, b):\n    _mk = lambda cu=torch.cuda: cu.Stream()\n    return _mk()\n"),
      "delegation"),
 ]
 

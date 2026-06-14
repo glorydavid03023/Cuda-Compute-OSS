@@ -109,7 +109,15 @@ def challenger_wins(
 
     Win requires BOTH: (1) a significant Mann-Whitney result (challenger stochastically faster), AND
     (2) the bootstrap LOWER CONFIDENCE BOUND on the median speedup clears `min_improvement_pct` — not a
-    raw point estimate, which noise alone pushes over the margin for a borderline kernel."""
+    raw point estimate, which noise alone pushes over the margin for a borderline kernel.
+
+    This is conservative BY DESIGN (the incumbent champion holds unless confidently beaten -> no
+    crown-thrash on noise). Cost: the EFFECTIVE bar sits somewhat above `min_improvement_pct` depending on
+    the latency noise. Monte-Carlo (n_blocks=30): a true +4.9% kernel — which the old point-estimate gate
+    crowned 26-44% of the time — now wins ~3%; at locked-clock CoV ~5% a true +8% wins ~50% and +12%
+    ~99% (lower noise on the production locked-clock host shifts these up). Calibrate `min_improvement_pct`
+    and `n_blocks` to the measured production-host CoV so genuine improvements at the intended margin are
+    rewarded; `_bootstrap_speedup_lb(lb_pct=...)` (the one-sided confidence level) is the strictness knob."""
     med_c = statistics.median(champion_latencies)
     med_x = statistics.median(challenger_latencies)
     speedup = (med_c / med_x) if med_x > 0 else float("inf")
