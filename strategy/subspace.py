@@ -111,6 +111,19 @@ def _default_rank(n: int) -> int:
     return int(min(n, max(64, n // 8)))
 
 
+def _flop_actual(n: int, m: int) -> float:
+    """FLOPs for one multiply_subspace call.
+
+    Two ``compress()`` calls (A and B), each doing ``X @ Q`` (2n^2m) then
+    ``Q.T @ (X @ Q)`` (2nm^2); the (m,m) core product Atil @ Btil (2m^3); and
+    ``reconstruct()``, doing ``Q @ Ctil`` (2nm^2) then ``(...) @ Q.T`` (2n^2m).
+    """
+    compress = 2 * n * n * m + 2 * n * m * m
+    core = 2.0 * m * m * m
+    reconstruct = 2 * n * m * m + 2 * n * n * m
+    return 2.0 * compress + core + reconstruct
+
+
 def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
     n = A.shape[0]
     if A.shape != (n, n) or B.shape != (n, n) or C.shape != (n, n):
@@ -141,7 +154,7 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
         "dtype": cfg.dtype,
         "working_set": bytes_human(3 * n * n * cfg.item_bytes),
         "flop_exact": 2.0 * n * n * n,
-        "flop_actual": 2.0 * (2 * n * n * m + m * m * m + n * n * m),
+        "flop_actual": _flop_actual(n, m),
     }
 
 

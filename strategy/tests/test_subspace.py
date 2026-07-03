@@ -54,6 +54,20 @@ def _run(A, B, m, transform, dtype="fp64"):
     return C
 
 
+# -- flop accounting (pure arithmetic, no GPU needed) ---------------------
+def test_flop_actual_matches_matmul_sum():
+    # Cross-check subspace._flop_actual against an independently-summed FLOP
+    # count for every matmul multiply_subspace actually performs: two
+    # compress() calls (X@Q then Q.T@(X@Q) each), the (m,m) core product,
+    # and reconstruct() (Q@Ctil then (...)@Q.T).
+    for n, m in [(8, 2), (12000, 1500), (24, 24), (100, 1)]:
+        compress_call = 2 * n * n * m + 2 * n * m * m
+        expected = (2 * compress_call            # compress(A) + compress(B)
+                    + 2 * m * m * m               # Atil @ Btil
+                    + 2 * n * m * m + 2 * n * n * m)  # reconstruct
+        assert subspace._flop_actual(n, m) == expected
+
+
 # -- streaming primitives -------------------------------------------------
 # The primitives stream the rows of X from the host but expect the *resident*
 # operand (Q / Om / Ctil) to already be a device tensor, exactly as production
