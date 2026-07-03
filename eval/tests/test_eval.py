@@ -13,7 +13,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from eval import metrics
-from eval.evaluator import EvalConfig, evaluate, estimate_scaling
+from eval.evaluator import EvalConfig, evaluate, estimate_scaling, _effective_rank_m
+from strategy import subspace
 
 
 class _Skip(Exception):
@@ -72,6 +73,21 @@ def test_score_monotonic_in_accuracy():
     lo = metrics.score(0.2, 1e6, 0.01)
     hi = metrics.score(0.9, 1e6, 0.01)
     assert hi > lo
+
+
+# ---- reported M matches the M the strategy actually uses (CPU) -----------
+def test_reported_rank_m_matches_strategy_default():
+    # The scorecard's reported M must equal what multiply_subspace actually uses
+    # (subspace.default_rank), NOT a recomputed n//8. They diverge for n < 512
+    # because default_rank floors M at 64 -- a run at n=96 executes M=64 but used
+    # to be reported as M=12.
+    for n in (96, 128, 256, 384, 511):
+        ev = EvalConfig(n=n, rank_m=None, verbose=False)
+        assert _effective_rank_m(ev) == subspace.default_rank(n)
+        assert _effective_rank_m(ev) != n // 8          # the old, wrong value
+    # At/above the floor boundary the two agree, and an explicit rank_m wins.
+    assert _effective_rank_m(EvalConfig(n=12000, rank_m=None)) == 12000 // 8
+    assert _effective_rank_m(EvalConfig(n=96, rank_m=32)) == 32
 
 
 # ---- end-to-end evaluate (GPU) -------------------------------------------

@@ -93,15 +93,23 @@ def reconstruct(Ctil, Q, C_out, backend: Backend, out_dtype):
 # ---------------------------------------------------------------------------
 # smart (subspace) multiply
 # ---------------------------------------------------------------------------
-def _default_rank(n: int) -> int:
+def default_rank(n: int) -> int:
+    """The subspace dimension M used when ``rank_m`` is None: ``n // 8`` but never
+    below 64 (and never above n) -- ``min(n, max(64, n // 8))``. This is the single
+    source of truth; callers that report M must use it rather than recomputing
+    ``n // 8`` (which disagrees for n < 512)."""
     return int(min(n, max(64, n // 8)))
+
+
+# Back-compat alias (pre-existing private name).
+_default_rank = default_rank
 
 
 def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
     n = A.shape[0]
     if A.shape != (n, n) or B.shape != (n, n) or C.shape != (n, n):
         raise ValueError("A, B, C must all be square n x n with matching n")
-    m = cfg.rank_m or _default_rank(n)
+    m = cfg.rank_m or default_rank(n)
     if not (1 <= m <= n):
         raise ValueError(f"rank_m must be in [1, n]; got {m} for n={n}")
     cdt = cfg.compute_dtype
