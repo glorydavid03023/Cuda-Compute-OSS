@@ -10,9 +10,9 @@ P A P B P with projector P = Q Q^T, so it is EXACT only when M = N or when A/B
 live in the subspace Q captures (low rank / smooth). Otherwise it is an
 approximation whose quality is set entirely by the transform.
 
-Cost: O(N^2 M) vs O(N^3) for the exact product (FLOP ratio ~ 3M/N). The
-streaming helpers read the big matrices one row-block at a time, so A/B may be
-disk-backed memmaps far larger than RAM/VRAM.
+Cost: O(N^2 M) vs O(N^3) for the exact product (FLOP ratio ~ 4M/N once the basis
+construction is counted, not ~3M/N). The streaming helpers read the big matrices
+one row-block at a time, so A/B may be disk-backed memmaps far larger than RAM/VRAM.
 
 Standalone: no imports from the sibling `matmul` package.
 """
@@ -112,7 +112,9 @@ def _default_rank(n: int) -> int:
 
 
 def _flop_actual(n: int, m: int) -> float:
-    """FLOPs for one multiply_subspace call.
+    """FLOPs for the CORE stages of one multiply_subspace call (basis excluded --
+    ``multiply_subspace`` adds ``transform.basis_flops(n, m)`` on top, since basis
+    cost is transform-specific).
 
     Two ``compress()`` calls (A and B), each doing ``X @ Q`` (2n^2m) then
     ``Q.T @ (X @ Q)`` (2nm^2); the (m,m) core product Atil @ Btil (2m^3); and
@@ -154,7 +156,10 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
         "dtype": cfg.dtype,
         "working_set": bytes_human(3 * n * n * cfg.item_bytes),
         "flop_exact": 2.0 * n * n * n,
-        "flop_actual": _flop_actual(n, m),
+        # core stages PLUS the transform's basis construction -- a mandatory
+        # O(N^2 M) per-call cost (e.g. rsvd's sketches + QR) that would otherwise
+        # be omitted, overstating the reported savings.
+        "flop_actual": _flop_actual(n, m) + transform.basis_flops(n, m),
     }
 
 
