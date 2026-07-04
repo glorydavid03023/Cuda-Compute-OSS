@@ -43,10 +43,13 @@ One `python -m eval …` run does all four measurements in a single pass:
    it is sampled from `torch.mps.current_allocated_memory`. Worst case over the
    couples.
 
-The four are folded into one ranking score, hard-gated by correctness:
+The four are folded into one ranking score, hard-gated by correctness **and** by
+the dominance rule below — a strategy scores non-zero only when it is admitted as
+an improvement over exact:
 
 ```
-score = accuracy × (1 / Peak_VRAM) × (1 / Latency)     # 0 if accuracy < floor
+score = accuracy × (1 / Peak_VRAM) × (1 / Latency)
+# 0 unless accuracy ≥ floor AND latency, VRAM and FLOPs are all below exact
 ```
 
 Reproduce the reference comparison on your GPU with:
@@ -125,9 +128,11 @@ they are not asserted here.
 - **The reference is the truth, and it is tested.** The exact engine is gated by
   [`tests/`](tests/) (ragged tiles, fp16 accumulation) on the GPU. A speed claim
   against an unverified baseline is meaningless, so we don't make one.
-- **Peak, not average, memory.** VRAM is the *peak* during the multiply,
-  including library scratch. A transient spike that would OOM a real device is
-  reported, not smoothed away.
+- **Peak, not average, memory.** VRAM is the *peak* of the PyTorch caching
+  allocator during the multiply — every transient tensor and workspace that goes
+  through PyTorch's allocator, not smoothed away. Allocations a library makes
+  *outside* PyTorch's allocator (raw `cudaMalloc` workspace) are not counted, so
+  treat the number as a lower bound on true device use.
 - **Wall-clock, fully synchronized.** GPU latency counts async work; we
   synchronize before timing and after. FLOP-count wins (`O(·)`) are reported
   separately from measured latency, because fewer FLOPs is *not* the same as less

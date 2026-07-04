@@ -33,6 +33,18 @@ def _gpu_available() -> bool:
 
 HAVE_GPU = _gpu_available()
 
+# The metric tests below are pure NumPy and run anywhere. The end-to-end GPU
+# tests are marked so pytest skips them *cleanly* (not as errors) when no device
+# is present; the internal ``_Skip`` guard keeps the __main__ runner working when
+# these are executed directly with `python eval/tests/test_eval.py`.
+try:
+    import pytest
+    _gpu_only = pytest.mark.skipif(
+        not HAVE_GPU, reason="no CUDA/MPS GPU; CCO computes on GPU only")
+except ImportError:
+    def _gpu_only(fn):
+        return fn
+
 
 # ---- metrics -------------------------------------------------------------
 def test_accuracy_identical_is_one():
@@ -52,6 +64,21 @@ def test_accuracy_floors_at_zero():
     # Approx with the negated matrix -> error >> 1 -> clamped to 0, never negative.
     C = np.ones((8, 8))
     assert metrics.accuracy(C, -C) == 0.0
+
+
+def test_rel_frobenius_error_keeps_climbing_past_the_accuracy_clamp():
+    # accuracy = max(0, 1 - error) floors at 0 once error >= 1, but the real
+    # relative Frobenius error keeps growing -- the two are not interchangeable
+    # above the clamp, so a caller wanting the true error (e.g. eval.evaluator's
+    # report) must call rel_frobenius_error directly rather than back-deriving
+    # it from accuracy (which would flatten every error >= 1 to exactly 1).
+    rng = np.random.default_rng(2)
+    C = rng.standard_normal((16, 16))
+    Chat = -3.0 * C                       # ||C - Chat||_F / ||C||_F == 4.0 exactly
+    err = metrics.rel_frobenius_error(C, Chat)
+    acc = metrics.accuracy(C, Chat)
+    assert abs(err - 4.0) < 1e-9
+    assert acc == 0.0
 
 
 def test_score_gated_by_accuracy_floor():
@@ -91,6 +118,7 @@ def test_reported_rank_m_matches_strategy_default():
 
 
 # ---- end-to-end evaluate (GPU) -------------------------------------------
+@_gpu_only
 def test_evaluate_smoke():
     if not HAVE_GPU:
         raise _Skip()
@@ -105,6 +133,7 @@ def test_evaluate_smoke():
     assert out["best"] == "rsvd"
 
 
+@_gpu_only
 def test_rsvd_accurate_on_lowrank():
     # On genuinely low-rank data the data-aware rsvd basis reconstructs closely.
     if not HAVE_GPU:
@@ -115,6 +144,7 @@ def test_rsvd_accurate_on_lowrank():
     assert out["transforms"]["rsvd"]["accuracy"] > 0.99
 
 
+@_gpu_only
 def test_scaling_exponent_runs():
     if not HAVE_GPU:
         raise _Skip()

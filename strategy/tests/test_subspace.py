@@ -32,6 +32,16 @@ def _gpu_available() -> bool:
 HAVE_GPU = _gpu_available()
 BK = Backend(verbose=False) if HAVE_GPU else None
 
+# Under pytest, skip the whole module cleanly when no GPU is present — every test
+# drives the GPU backend through BK, which is None without a device. (The
+# __main__ runner does its own skip for direct `python .../test_subspace.py`.)
+try:
+    import pytest
+    pytestmark = pytest.mark.skipif(
+        not HAVE_GPU, reason="no CUDA/MPS GPU; CCO computes on GPU only")
+except ImportError:
+    pass
+
 
 def _rel(a, b):
     return float(np.linalg.norm(a - b) / (np.linalg.norm(b) or 1.0))
@@ -44,13 +54,33 @@ def _run(A, B, m, transform, dtype="fp64"):
     return C
 
 
+# -- flop accounting (pure arithmetic, no GPU needed) ---------------------
+def test_flop_actual_matches_matmul_sum():
+    # Cross-check subspace._flop_actual against an independently-summed FLOP
+    # count for every matmul multiply_subspace actually performs: two
+    # compress() calls (X@Q then Q.T@(X@Q) each), the (m,m) core product,
+    # and reconstruct() (Q@Ctil then (...)@Q.T).
+    for n, m in [(8, 2), (12000, 1500), (24, 24), (100, 1)]:
+        compress_call = 2 * n * n * m + 2 * n * m * m
+        expected = (2 * compress_call            # compress(A) + compress(B)
+                    + 2 * m * m * m               # Atil @ Btil
+                    + 2 * n * m * m + 2 * n * n * m)  # reconstruct
+        assert subspace._flop_actual(n, m) == expected
+
+
 # -- streaming primitives -------------------------------------------------
+# The primitives stream the rows of X from the host but expect the *resident*
+# operand (Q / Om / Ctil) to already be a device tensor, exactly as production
+# transforms hand them one via backend.to_device. Pass host NumPy and torch.matmul
+# raises; likewise the device-resident result must come back through to_host
+# before it can be compared with NumPy.
 def test_compress_matches_direct():
     rng = np.random.default_rng(0)
     n, m = 40, 12
     X = rng.standard_normal((n, n))
     Q = np.linalg.qr(rng.standard_normal((n, m)))[0]
-    got = np.asarray(subspace.compress(X, Q, BK, np.float64))
+    Qd = BK.to_device(Q.astype(np.float64))
+    got = BK.to_host(subspace.compress(X, Qd, BK, np.float64))
     assert _rel(got, Q.T @ X @ Q) < 1e-12
 
 
@@ -59,8 +89,10 @@ def test_reconstruct_matches_direct():
     n, m = 40, 12
     Ctil = rng.standard_normal((m, m))
     Q = np.linalg.qr(rng.standard_normal((n, m)))[0]
+    Qd = BK.to_device(Q.astype(np.float64))
+    Ctild = BK.to_device(Ctil.astype(np.float64))
     C = np.zeros((n, n))
-    subspace.reconstruct(Ctil, Q, C, BK, np.float64)
+    subspace.reconstruct(Ctild, Qd, C, BK, np.float64)
     assert _rel(C, Q @ Ctil @ Q.T) < 1e-12
 
 
@@ -69,8 +101,11 @@ def test_stream_primitives():
     n, m = 32, 7
     X = rng.standard_normal((n, n))
     Om = rng.standard_normal((n, m))
-    assert _rel(np.asarray(subspace.stream_gemm_right(X, Om, BK, np.float64)), X @ Om) < 1e-12
-    assert _rel(np.asarray(subspace.stream_gemm_left_t(X, Om, BK, np.float64)), X.T @ Om) < 1e-12
+    Omd = BK.to_device(Om.astype(np.float64))
+    right = BK.to_host(subspace.stream_gemm_right(X, Omd, BK, np.float64))
+    left = BK.to_host(subspace.stream_gemm_left_t(X, Omd, BK, np.float64))
+    assert _rel(right, X @ Om) < 1e-12
+    assert _rel(left, X.T @ Om) < 1e-12
 
 
 def test_exact_baseline_matches_numpy():

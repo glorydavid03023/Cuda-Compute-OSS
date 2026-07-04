@@ -26,6 +26,16 @@ def _gpu_available() -> bool:
 
 HAVE_GPU = _gpu_available()
 
+# Under pytest, skip the whole module cleanly when no GPU is present — otherwise
+# the GPU-gated imports below never run and the test bodies hit undefined names.
+# (The __main__ runner does its own skip for `python tests/test_correctness.py`.)
+try:
+    import pytest
+    pytestmark = pytest.mark.skipif(
+        not HAVE_GPU, reason="no CUDA/MPS GPU; CCO computes on GPU only")
+except ImportError:
+    pass
+
 if HAVE_GPU:
     from matmul import matmul
     from matmul.backend import Backend

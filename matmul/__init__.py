@@ -7,7 +7,7 @@ Quick API
 
     A = np.random.rand(4096, 4096).astype("float32")
     B = np.random.rand(4096, 4096).astype("float32")
-    C = matmul(A, B)            # runs on GPU if available, else CPU
+    C = matmul(A, B)            # GPU only (CUDA/MPS); raises if no GPU is present
 
 For huge n that will not fit in RAM, use the disk-backed runner in
 ``matmul.runner`` or the CLI (``python -m matmul``).

@@ -12,8 +12,11 @@ The final score rewards accurate, memory-light, low-latency strategies:
 
     score = Accuracy × (1 / Peak_VRAM) × (1 / Latency)
 
-and is hard-gated to zero when the accuracy falls below a floor, so a strategy
-that is fast and tiny but wrong cannot win.
+and is hard-gated to zero unless the strategy is admitted as an **improvement**
+over the exact baseline. Admission (the dominance rule in BENCHMARKS.md) requires
+accuracy at/above the floor AND every cost axis — latency, peak VRAM, and FLOP
+count — strictly below the exact baseline. A strategy that is fast and tiny but
+wrong, or accurate but slower / heavier than exact, therefore cannot win.
 """
 from __future__ import annotations
 
@@ -61,3 +64,26 @@ def score(
     vram = max(peak_vram_bytes, 1.0) / unit          # guard against 0 / negative
     lat = max(latency_s, 1e-9)                        # guard against 0 latency
     return float(accuracy_score * (1.0 / vram) * (1.0 / lat))
+
+
+def dominates_exact(
+    latency_s: float,
+    peak_vram_bytes: float,
+    flop_ratio_vs_exact: float | None,
+    exact_latency_s: float,
+    exact_peak_vram_bytes: float,
+) -> bool:
+    """The dominance gate (BENCHMARKS.md): does the strategy reduce *every* cost
+    axis versus the exact baseline?
+
+    Returns True only if wall-clock latency, peak VRAM, and FLOP count are all
+    strictly lower than exact (``flop_ratio_vs_exact`` > 1 means fewer FLOPs than
+    exact). A single regressing axis disqualifies the strategy — we never average
+    a win on one axis against a loss on another. Accuracy is gated separately by
+    the floor in :func:`score`.
+    """
+    return (
+        latency_s < exact_latency_s
+        and peak_vram_bytes < exact_peak_vram_bytes
+        and (flop_ratio_vs_exact or 0.0) > 1.0
+    )

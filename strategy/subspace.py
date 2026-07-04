@@ -26,9 +26,19 @@ from .storage import bytes_human
 from .transforms import get_transform
 
 
-def _row_block(n: int, cols: int, backend: Backend, item_bytes: int) -> int:
-    """Choose how many rows of an (n x cols) stream to stage on the device."""
-    budget = int(backend.free_compute_bytes() * 0.3)
+# Fraction of free device memory a single streamed row-block may occupy when no
+# explicit budget is supplied (e.g. the primitives are called directly). Real
+# strategy runs pass ``cfg.vram_fraction`` through instead.
+_DEFAULT_ROW_BLOCK_FRACTION = 0.3
+
+
+def _row_block(n: int, cols: int, backend: Backend, item_bytes: int,
+               frac: float = _DEFAULT_ROW_BLOCK_FRACTION) -> int:
+    """Choose how many rows of an (n x cols) stream to stage on the device.
+
+    ``frac`` is the fraction of free device memory one row-block may use
+    (``Config.vram_fraction`` when driven by the strategy)."""
+    budget = int(backend.free_compute_bytes() * frac)
     per_row = max(1, cols * item_bytes)
     return int(min(n, max(1, budget // per_row)))
 
@@ -36,12 +46,13 @@ def _row_block(n: int, cols: int, backend: Backend, item_bytes: int) -> int:
 # ---------------------------------------------------------------------------
 # streaming BLAS-3 primitives (row-block streamed; memmap-friendly)
 # ---------------------------------------------------------------------------
-def stream_gemm_right(X, Q, backend: Backend, dtype):
+def stream_gemm_right(X, Q, backend: Backend, dtype,
+                      frac: float = _DEFAULT_ROW_BLOCK_FRACTION):
     """Return X @ Q  (n x m), streaming the rows of X. Q is resident (n x m)."""
     xp = backend.xp
     n, m = X.shape[0], Q.shape[1]
     out = xp.empty((n, m), dtype=dtype)
-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize)
+    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac)
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
@@ -49,13 +60,14 @@ def stream_gemm_right(X, Q, backend: Backend, dtype):
     return out
 
 
-def stream_gemm_left_t(X, Q, backend: Backend, dtype):
+def stream_gemm_left_t(X, Q, backend: Backend, dtype,
+                       frac: float = _DEFAULT_ROW_BLOCK_FRACTION):
     """Return X^T @ Q  (n x m) for square X, streaming the rows of X:
     X^T @ Q = sum over row-blocks of X[rb,:]^T @ Q[rb,:]."""
     xp = backend.xp
     n, m = X.shape[0], Q.shape[1]
     acc = xp.zeros((n, m), dtype=dtype)
-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize)
+    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac)
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
@@ -63,13 +75,14 @@ def stream_gemm_left_t(X, Q, backend: Backend, dtype):
     return acc
 
 
-def compress(X, Q, backend: Backend, dtype):
+def compress(X, Q, backend: Backend, dtype,
+             frac: float = _DEFAULT_ROW_BLOCK_FRACTION):
     """Return Q^T X Q  (m x m), streaming the rows of X:
     Q^T X Q = sum over row-blocks  Q[rb,:]^T @ (X[rb,:] @ Q)."""
     xp = backend.xp
     n, m = X.shape[0], Q.shape[1]
     acc = xp.zeros((m, m), dtype=dtype)
-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize)
+    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac)
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
@@ -77,10 +90,11 @@ def compress(X, Q, backend: Backend, dtype):
     return acc
 
 
-def reconstruct(Ctil, Q, C_out, backend: Backend, out_dtype):
+def reconstruct(Ctil, Q, C_out, backend: Backend, out_dtype,
+                frac: float = _DEFAULT_ROW_BLOCK_FRACTION):
     """Write Q @ Ctil @ Q^T  (n x n) into C_out, streaming output row-blocks."""
     n = Q.shape[0]
-    blk = _row_block(n, n, backend, np.dtype(out_dtype).itemsize)
+    blk = _row_block(n, n, backend, np.dtype(out_dtype).itemsize, frac)
     QT = Q.T
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
@@ -119,10 +133,11 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
     if Q.shape != (n, m):
         raise ValueError(f"transform returned basis {Q.shape}, expected {(n, m)}")
 
-    Atil = compress(A, Q, backend, cdt)                   # (m, m)
-    Btil = compress(B, Q, backend, cdt)                   # (m, m)
+    frac = cfg.vram_fraction
+    Atil = compress(A, Q, backend, cdt, frac)             # (m, m)
+    Btil = compress(B, Q, backend, cdt, frac)             # (m, m)
     Ctil = backend.matmul(Atil, Btil)                     # (m, m)  -- cheap core
-    reconstruct(Ctil, Q, C, backend, cfg.np_dtype)
+    reconstruct(Ctil, Q, C, backend, cfg.np_dtype, frac)
 
     return {
         "n": n,
@@ -134,7 +149,7 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
         "dtype": cfg.dtype,
         "working_set": bytes_human(3 * n * n * cfg.item_bytes),
         "flop_exact": 2.0 * n * n * n,
-        "flop_actual": 2.0 * (2 * n * n * m + m * m * m + n * n * m),
+        "flop_actual": _flop_actual(n, m),
     }
 
 
@@ -148,7 +163,7 @@ def multiply_exact(A, B, C, backend: Backend, cfg: Config) -> dict:
     n = A.shape[0]
     dt = cfg.compute_dtype
     Bdev = backend.to_device(np.asarray(B).astype(dt, copy=False))
-    blk = _row_block(n, n, backend, np.dtype(dt).itemsize)
+    blk = _row_block(n, n, backend, np.dtype(dt).itemsize, cfg.vram_fraction)
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
         Ar = backend.to_device(np.asarray(A[r0:r1, :]).astype(dt, copy=False))

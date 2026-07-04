@@ -14,6 +14,7 @@ measured the same way for everyone.
 - **Normal (exact)** engine — the frontier you must beat: [`matmul/`](matmul/)
 - **Smart (approximate)** strategies — where you contribute: [`strategy/`](strategy/)
 - **The scorer** — one honest number per strategy: [`eval/`](eval/)
+- **Landing page** — the project overview site: [zeokin.github.io/Cuda-Compute-OSS](https://zeokin.github.io/Cuda-Compute-OSS/index/index.html)
 
 Reference setup: **`12000 × 12000`** matrices, **full-rank** (random) data, on an
 **A100 (80 GB)** GPU via PyTorch.
@@ -87,7 +88,9 @@ Every strategy is scored by:
 combined into a single ranking score:
 
 ```
-score = accuracy × (1 / Peak_VRAM) × (1 / Latency)     # 0 if accuracy < floor
+score = accuracy × (1 / Peak_VRAM) × (1 / Latency)
+# 0 unless admitted as an improvement: accuracy ≥ floor AND latency, VRAM and
+# FLOPs all below the exact baseline (the dominance rule)
 ```
 
 See [BENCHMARKS.md](BENCHMARKS.md) for exactly how each number is produced.
@@ -123,8 +126,11 @@ The fast way to a good score is usually a lie. These are rejected on sight:
   couples drawn from the same distribution.
 - **No hidden precision downgrade.** Report the dtype you ran. Accuracy and
   latency must come from the *same* run at the *same* precision.
-- **No unmeasured memory.** Peak VRAM is sampled during the whole multiply,
-  including library scratch — you cannot exclude a transient spike.
+- **No unmeasured memory.** Peak VRAM is the peak of the PyTorch caching
+  allocator during the whole multiply (`max_memory_allocated` on CUDA) — every
+  transient tensor and workspace PyTorch allocates, not just the result. Memory
+  a library grabs *outside* PyTorch's allocator is not captured; you cannot
+  exclude a transient spike that goes through PyTorch.
 - **No micro-win aggregation.** Sub-threshold gains are not summed across sizes
   or regimes to manufacture a headline; each claim stands on one regime.
 - **Numbers over narrative.** If the scorecard and the description disagree, the
