@@ -125,6 +125,7 @@ def test_evaluate_smoke():
     ev = EvalConfig(n=96, pairs=2, dtype="fp32", fill="lowrank", data_rank=4,
                     transforms=["rsvd"], verbose=False)
     out = evaluate(ev)
+    assert out["config"]["rank_m"] == default_rank_m(96)
     assert set(out["transforms"]) == {"rsvd"}
     for r in out["transforms"].values():
         assert 0.0 <= r["accuracy"] <= 1.0

@@ -25,6 +25,7 @@ from strategy import transforms as _transforms
 from strategy.backend import Backend
 from strategy.config import Config
 from strategy import subspace, storage
+from strategy.subspace import default_rank_m
 
 from . import metrics
 from .memory import MemoryProbe
