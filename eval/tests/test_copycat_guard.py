@@ -7,7 +7,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from eval.copycat_guard import fingerprint, check, worst_verdict, containment, check_one_pr
+from eval.copycat_guard import (
+    check,
+    check_one_pr,
+    containment,
+    fingerprint,
+    is_docs_only,
+    worst_verdict,
+)
 from eval.github_client import PRInfo
 
 ORIGINAL_DIFF = """\
@@ -97,6 +104,15 @@ diff --git a/README.md b/README.md
 +Nothing to do with transforms at all.
 """
 
+DOCS_SUBTREE_DIFF = """\
+diff --git a/docs/testing-strategy.md b/docs/testing-strategy.md
+--- a/docs/testing-strategy.md
++++ b/docs/testing-strategy.md
+@@ -1,0 +2,2 @@
++Explain the maintainer GPU window.
++Explain the public queue semantics.
+"""
+
 
 def test_verbatim_copy_is_blocked():
     orig = fingerprint(ORIGINAL_DIFF)
@@ -130,6 +146,12 @@ def test_identical_diff_has_full_containment():
     orig = fingerprint(ORIGINAL_DIFF)
     same = fingerprint(ORIGINAL_DIFF)
     assert containment(same, orig) == 1.0
+
+
+def test_is_docs_only_recognizes_root_and_docs_subtree_files():
+    assert is_docs_only(fingerprint(UNRELATED_DIFF).files)
+    assert is_docs_only(fingerprint(DOCS_SUBTREE_DIFF).files)
+    assert not is_docs_only(fingerprint(ORIGINAL_DIFF).files)
 
 
 def test_worst_verdict_picks_the_strongest_match_and_stops_at_block():
@@ -191,6 +213,19 @@ def test_check_one_pr_ignores_same_authors_earlier_pr():
     )
     author, verdict = check_one_pr(client, 2)
     assert verdict.tier == "clear"
+
+
+def test_check_one_pr_skips_docs_only_prs():
+    pr1 = PRInfo(number=1, title="t1", author="alice", is_draft=False, head_sha="s1")
+    pr2 = PRInfo(number=2, title="t2", author="mallory", is_draft=False, head_sha="s2")
+    client = _FakeClientForOnePR(
+        prs_all={1: pr1, 2: pr2},
+        diffs={1: ORIGINAL_DIFF, 2: UNRELATED_DIFF},
+    )
+    author, verdict = check_one_pr(client, 2)
+    assert author is None
+    assert verdict.tier == "clear"
+    assert verdict.reason == "docs-only change"
 
 
 if __name__ == "__main__":

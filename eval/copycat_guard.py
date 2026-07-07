@@ -42,6 +42,8 @@ CONTAINMENT_WARN = 0.70
 STRUCTURAL_FLOOR = 0.40      # below this containment, don't bother checking structural similarity
 LEVENSHTEIN_THRESHOLD = 0.70
 BIGRAM_COSINE_THRESHOLD = 0.60
+DOC_ONLY_EXACT = frozenset({"README.md", "CONTRIBUTING.md", "BENCHMARKS.md", "LICENSE"})
+DOC_ONLY_PREFIXES = ("docs/",)
 
 _COMMENT_RE = re.compile(r"^\s*#")
 _TIER_RANK = {"clear": 0, "warn": 1, "block": 2}
@@ -82,6 +84,13 @@ def fingerprint(diff_text: str) -> Fingerprint:
             if content and not _COMMENT_RE.match(content):
                 added.add(content)
     return Fingerprint(files=frozenset(files), added=frozenset(added))
+
+
+def is_docs_only(files: frozenset) -> bool:
+    return bool(files) and all(
+        path in DOC_ONLY_EXACT or path.startswith(DOC_ONLY_PREFIXES)
+        for path in files
+    )
 
 
 def containment(candidate: Fingerprint, original: Fingerprint) -> float:
@@ -179,6 +188,8 @@ def check_one_pr(client: GitHubClient, pr_number: int) -> tuple:
     to do with the result (see :func:`main`)."""
     candidate_pr = client.get_pr(pr_number)
     candidate_fp = fingerprint(client.get_diff(pr_number))
+    if is_docs_only(candidate_fp.files):
+        return None, Verdict(False, "clear", 0.0, "docs-only change")
 
     earlier = [p for p in client.list_prs("all") if p.number < pr_number]
     originals = [

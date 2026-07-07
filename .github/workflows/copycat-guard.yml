@@ -10,7 +10,7 @@ name: Copycat guard
 
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
 
 permissions:
   contents: read
