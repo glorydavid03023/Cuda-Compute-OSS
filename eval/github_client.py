@@ -22,6 +22,7 @@ class PRInfo:
     is_draft: bool
     head_sha: str
     body: str = ""
+    url: str = ""
 
 
 class GitHubClient:
@@ -35,22 +36,24 @@ class GitHubClient:
 
     def list_prs(self, state: str = "open") -> list:
         out = self._run("pr", "list", "--state", state, "-L", "300", "--json",
-                        "number,title,author,isDraft,headRefOid,body")
+                        "number,title,author,isDraft,headRefOid,body,url")
         data = json.loads(out)
         return [
             PRInfo(number=d["number"], title=d["title"],
                    author=d["author"]["login"], is_draft=d["isDraft"],
-                   head_sha=d["headRefOid"], body=d.get("body") or "")
+                   head_sha=d["headRefOid"], body=d.get("body") or "",
+                   url=d.get("url") or "")
             for d in data
         ]
 
     def get_pr(self, pr_number: int) -> PRInfo:
         out = self._run("pr", "view", str(pr_number), "--json",
-                        "number,title,author,isDraft,headRefOid,body")
+                        "number,title,author,isDraft,headRefOid,body,url")
         d = json.loads(out)
         return PRInfo(number=d["number"], title=d["title"],
                       author=d["author"]["login"], is_draft=d["isDraft"],
-                      head_sha=d["headRefOid"], body=d.get("body") or "")
+                      head_sha=d["headRefOid"], body=d.get("body") or "",
+                      url=d.get("url") or "")
 
     def get_diff(self, pr_number: int) -> str:
         return self._run("pr", "diff", str(pr_number))

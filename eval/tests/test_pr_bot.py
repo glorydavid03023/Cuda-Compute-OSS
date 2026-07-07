@@ -8,11 +8,24 @@ orchestration layer with a fake in-memory GitHub, never real `gh` calls.
 """
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from eval import copycat_guard
-from eval.pr_bot import PRInfo, process_pr, run_once, has_scorecard, already_evaluated
+from eval.pr_bot import (
+    GPU_QUEUE_LABEL,
+    PROTECTED_PATH_LABEL,
+    PRInfo,
+    already_evaluated,
+    build_queue_dashboard,
+    changed_files,
+    has_scorecard,
+    process_pr,
+    run_once,
+    protected_paths,
+    write_queue_dashboard,
+)
 
 # Matches .github/workflows/labeler.yml's status:needs-scorecard detector
 # (an actual filled-in accuracy/latency number or RESULT_JSON, not just a
@@ -39,6 +52,14 @@ diff --git a/strategy/transforms.py b/strategy/transforms.py
 +    def basis(self, n, m, backend, dtype, A=None, B=None): return None
 """
 
+PROTECTED_DIFF = """\
+diff --git a/eval/evaluator.py b/eval/evaluator.py
+--- a/eval/evaluator.py
++++ b/eval/evaluator.py
+@@ -1,0 +2,1 @@
++print("changed scoring")
+"""
+
 
 def _pr(number=1, author="alice", is_draft=False, head_sha="sha1", body=SCORECARD_BODY):
     return PRInfo(number=number, title=f"PR {number}", author=author,
@@ -53,6 +74,20 @@ def test_draft_is_skipped():
 def test_blocked_contributor_is_closed():
     out = process_pr(_pr(author="badactor"), SOME_DIFF, [], frozenset({"badactor"}), [])
     assert out.action == "close_blocked"
+
+
+def test_changed_files_from_diff():
+    assert changed_files(SOME_DIFF) == frozenset({"strategy/transforms.py"})
+
+
+def test_protected_paths_are_detected():
+    assert protected_paths(PROTECTED_DIFF) == ("eval/evaluator.py",)
+
+
+def test_protected_path_is_not_queued():
+    out = process_pr(_pr(author="alice"), PROTECTED_DIFF, [], frozenset(), [])
+    assert out.action == "protected_path"
+    assert out.label == PROTECTED_PATH_LABEL
 
 
 def test_copycat_block_beats_scorecard_check():
@@ -87,6 +122,7 @@ def test_missing_scorecard_is_flagged():
 def test_clean_pr_with_no_runner_is_eval_pending():
     out = process_pr(_pr(body=SCORECARD_BODY), SOME_DIFF, [], frozenset(), [], run_eval=None)
     assert out.action == "eval_pending"
+    assert out.label == GPU_QUEUE_LABEL
 
 
 def test_clean_pr_with_runner_is_evaluated():
@@ -166,6 +202,24 @@ def test_run_once_live_mode_applies_actions():
     assert any(a[0] == "post_comment" for a in client.actions)
 
 
+def test_run_once_live_mode_labels_gpu_queue():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
+    client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: SOME_DIFF})
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "eval_pending"
+    assert ("add_label", 1, GPU_QUEUE_LABEL) in client.actions
+    assert any("next batched GPU evaluation" in a[2] for a in client.actions
+               if a[0] == "post_comment")
+
+
+def test_run_once_live_mode_labels_protected_path():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
+    client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: PROTECTED_DIFF})
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "protected_path"
+    assert ("add_label", 1, PROTECTED_PATH_LABEL) in client.actions
+
+
 def test_run_once_originals_include_prs_between_two_open_ones():
     # A merged PR #2 sits between open PRs #1 and #3; #3 copying #2 must be
     # caught even though #2 itself is never "open".
@@ -182,6 +236,33 @@ def test_run_once_originals_include_prs_between_two_open_ones():
     outcomes = run_once(client, dry_run=True)
     pr3_outcome = next(o for o in outcomes if o.pr == 3)
     assert pr3_outcome.action == "copycat_block", pr3_outcome
+
+
+def test_queue_dashboard_orders_ready_prs_oldest_first():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
+    pr2 = _pr(number=2, author="bob", body=NO_SCORECARD_BODY)
+    pr3 = _pr(number=3, author="carol", body=SCORECARD_BODY)
+    outcomes = [
+        process_pr(pr1, SOME_DIFF, [], frozenset(), []),
+        process_pr(pr2, SOME_DIFF, [], frozenset(), []),
+        process_pr(pr3, SOME_DIFF, [], frozenset(), []),
+    ]
+    data = build_queue_dashboard([pr1, pr2, pr3], outcomes)
+    assert [item["pr"] for item in data["queue"]] == [1, 3]
+    assert [item["position"] for item in data["queue"]] == [1, 2]
+    assert len(data["open_prs"]) == 3
+
+
+def test_queue_dashboard_write_skips_timestamp_only_churn():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
+    outcome = process_pr(pr1, SOME_DIFF, [], frozenset(), [])
+    data = build_queue_dashboard([pr1], [outcome])
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "data.json")
+        assert write_queue_dashboard(path, data)
+        first = open(path, encoding="utf-8").read()
+        assert not write_queue_dashboard(path, data)
+        assert open(path, encoding="utf-8").read() == first
 
 
 if __name__ == "__main__":

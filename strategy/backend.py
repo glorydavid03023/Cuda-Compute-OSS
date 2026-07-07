@@ -125,8 +125,8 @@ class Backend:
             import torch  # type: ignore
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
-                "CCO requires PyTorch. Install it (see requirements.txt): "
-                "pip install torch"
+                "CCO GPU evaluation requires PyTorch. Install the GPU extra: "
+                "uv sync --extra gpu"
             ) from exc
 
         _install_astype(torch)

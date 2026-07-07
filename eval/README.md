@@ -78,6 +78,24 @@ Key flags: `--n`, `--pairs`, `--dtype {fp16,fp32,fp64}`, `--rank-m M`,
 `--fill {random,lowrank,iota}`, `--data-rank`, `--transforms rsvd`,
 `--min-accuracy`, `--vram-unit {bytes,mib,gib}`, `--sweep`, `--device`, `--json`.
 
+## Batched PR Evaluation
+
+The always-on PR bot writes the oldest-first GPU queue to `dashboard/data.json`.
+During a maintainer-controlled GPU window, preview or run that queue with:
+
+```bash
+# no GPU needed; prints the exact commands that will run
+uv run --extra test python -m eval.gpu_batch --limit 3
+
+# GPU required; checks out queued PRs and evaluates them sequentially
+uv run --extra test python -m eval.gpu_batch --limit 3 --run --clean
+```
+
+The runner verifies that each checkout's `HEAD` matches the SHA recorded by the
+queue before it runs tests or scoring. It omits `--seed` unless you pass one, so
+official scoring uses fresh unseen inputs while still recording the seed inside
+the JSON emitted by `python -m eval`.
+
 ## Use it — Python API
 
 ```python
@@ -112,6 +130,7 @@ eval/
   memory.py     MemoryProbe — peak GPU VRAM (CUDA exact / MPS sampled)
   evaluator.py  generate couples, run normal+smart, collect metrics, fit scaling
   cli.py        python -m eval
+  gpu_batch.py  consume dashboard/data.json and run queued PRs sequentially
   tests/        unit tests (run on CPU)
 ```
 

@@ -1,8 +1,13 @@
+# Legacy pip requirements. Prefer uv:
+#   uv sync --extra test              # CPU-safe contributor setup
+#   uv sync --extra test --extra gpu  # GPU scoring setup
+#
 # Core (always required)
 numpy>=1.24        # host-side arrays, memmap storage, reference/scoring math
 
-# Compute backend (required) — CCO runs every matrix product on a GPU with
-# PyTorch (CUDA or Apple MPS). There is no CPU or CuPy backend.
+# Compute backend (required only for GPU scoring) — CCO runs scored matrix
+# products on a GPU with PyTorch (CUDA or Apple MPS). There is no CPU or CuPy
+# scoring backend.
 #   NVIDIA GPU (CUDA 12.x)  ->  pip install torch
 #   Apple Silicon (MPS)     ->  pip install torch
 torch>=2.1

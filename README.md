@@ -152,30 +152,43 @@ The fast way to a good score is usually a lie. These are rejected on sight:
 
 ## Quick Start
 
-CCO computes on a **GPU** (CUDA or Apple MPS) via **PyTorch** — there is no CPU
-or CuPy backend. You need a GPU machine (reference: A100, 80 GB).
+CCO uses **uv** for the normal contributor environment. The default install is
+CPU-safe and is enough for PR checks, syntax checks, tests that do not require a
+GPU, and the transform smoke test. Real scoring still computes on a **GPU**
+(CUDA or Apple MPS) via **PyTorch** — there is no CPU or CuPy scoring backend.
 
 ```bash
-# 1. install (NumPy + PyTorch — see requirements.txt)
-pip install -r requirements.txt
+# 1. install the CPU-safe contributor environment
+uv sync --extra test
 
 # 2. fast, no-GPU sanity check for every registered transform
-python -m strategy.smoke
+uv run python -m strategy.smoke
 
-# 3. see the exact baseline work (n defaults to 12000)
-python -m matmul --n 12000 --verify
+# 3. run the same CPU-safe validation used by PR CI
+uv run --extra test python -m pytest tests/ strategy/tests/ eval/tests/ -v
+```
 
-# 4. run a smart strategy
-python -m strategy --n 12000 --transform rsvd --verify
+For a real scorecard, use a GPU machine (reference: A100, 80 GB) and opt into
+the GPU extra:
 
-# 5. self-score all strategies on the reference regime: 12000, full-rank
+```bash
+# 4. install PyTorch for GPU scoring
+uv sync --extra test --extra gpu
+
+# 5. see the exact baseline work (n defaults to 12000)
+uv run python -m matmul --n 12000 --verify
+
+# 6. run a smart strategy
+uv run python -m strategy --n 12000 --transform rsvd --verify
+
+# 7. self-score all strategies on the reference regime: 12000, full-rank
 #    (this is what you paste in a PR)
-python -m eval --n 12000 --pairs 3
+uv run python -m eval --n 12000 --pairs 3
 
-# 6. run the tests (they skip if no GPU is present)
-python tests/test_correctness.py
-python eval/tests/test_eval.py
-python strategy/tests/test_subspace.py
+# 8. run the GPU-aware tests (GPU-only cases skip if no GPU is present)
+uv run python tests/test_correctness.py
+uv run python eval/tests/test_eval.py
+uv run python strategy/tests/test_subspace.py
 ```
 
 Start at [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -200,8 +213,9 @@ CCO/
 ├── CONTRIBUTING.md    the one rule · self-score locally · submit
 ├── BENCHMARKS.md      how every number is produced · honesty notes
 ├── LICENSE            MIT
-├── requirements.txt
-├── pyproject.toml
+├── pyproject.toml     package metadata and uv extras (test, gpu)
+├── uv.lock            reproducible uv resolution for maintainers and miners
+├── dashboard/         bot-updated PR queue view
 └── .github/
     ├── CODEOWNERS                 maintainer-owned paths (eval/, docs/, .github/)
     └── PULL_REQUEST_TEMPLATE.md   the scorecard your PR must fill in

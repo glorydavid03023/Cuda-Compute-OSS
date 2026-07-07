@@ -1,0 +1,86 @@
+name: GPU batch evaluation
+
+# Manual only. Use this when a maintainer has attached a disposable/self-hosted
+# GPU runner. The always-on PR bot builds the queue; this workflow consumes it
+# sequentially during a controlled GPU window.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Number of queued PRs to evaluate; 0 means all"
+        required: true
+        default: "1"
+      n:
+        description: "Matrix edge N"
+        required: true
+        default: "12000"
+      pairs:
+        description: "Random couples per PR"
+        required: true
+        default: "3"
+      transforms:
+        description: "Optional comma-separated transform names"
+        required: false
+        default: ""
+      seed:
+        description: "Optional reproduction seed; leave empty for unseen inputs"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: gpu-batch-evaluation
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Run queued PRs sequentially
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          N: ${{ github.event.inputs.n }}
+          PAIRS: ${{ github.event.inputs.pairs }}
+          TRANSFORMS: ${{ github.event.inputs.transforms }}
+          SEED: ${{ github.event.inputs.seed }}
+        run: |
+          set -euo pipefail
+          args=(
+            --repo "${{ github.repository }}"
+            --queue dashboard/data.json
+            --limit "$LIMIT"
+            --n "$N"
+            --pairs "$PAIRS"
+            --run
+            --clean
+          )
+          if [ -n "$TRANSFORMS" ]; then
+            args+=(--transforms "$TRANSFORMS")
+          fi
+          if [ -n "$SEED" ]; then
+            args+=(--seed "$SEED")
+          fi
+          uv run --extra test python -m eval.gpu_batch "${args[@]}"
+
+      - name: Upload raw GPU results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-results
+          path: gpu-results/*.json
+          if-no-files-found: warn

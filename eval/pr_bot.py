@@ -25,6 +25,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import copycat_guard
@@ -33,6 +34,11 @@ from .github_client import GitHubClient, PRInfo
 REPO_DEFAULT = "zeokin/Cuda-Compute-OSS"
 BLOCKED_CONTRIBUTORS_PATH = ".github/blocked-contributors.txt"
 IDEMPOTENCY_MARKER = "<!-- cco-eval:{sha} -->"
+GPU_QUEUE_LABEL = "status:queued-gpu"
+GPU_QUEUE_READY_ACTIONS = frozenset({"eval_pending", "already_evaluated"})
+PROTECTED_PATH_LABEL = "status:protected-path"
+PROTECTED_PATH_PREFIXES = ("eval/", "docs/", ".github/")
+PROTECTED_PATH_EXACT = frozenset({"dashboard/data.json"})
 
 # Matches .github/workflows/labeler.yml's existing status:needs-scorecard
 # detector exactly (kept as one Python regex so the two never drift): treat
@@ -73,6 +79,26 @@ def has_scorecard(body: str) -> bool:
     return bool(SCORECARD_RE.search(body or ""))
 
 
+def changed_files(diff_text: str) -> frozenset[str]:
+    files = set()
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+            if path.startswith("b/"):
+                path = path[2:]
+            if path and path != "/dev/null":
+                files.add(path)
+    return frozenset(files)
+
+
+def protected_paths(diff_text: str) -> tuple[str, ...]:
+    hits = []
+    for path in sorted(changed_files(diff_text)):
+        if path in PROTECTED_PATH_EXACT or path.startswith(PROTECTED_PATH_PREFIXES):
+            hits.append(path)
+    return tuple(hits)
+
+
 def process_pr(
     pr: PRInfo,
     diff_text: str,
@@ -100,6 +126,15 @@ def process_pr(
         return GateOutcome(pr.number, "close_blocked",
                            detail=f"{pr.author} is on the blocked-contributors list")
 
+    protected = protected_paths(diff_text)
+    if protected:
+        return GateOutcome(
+            pr.number,
+            "protected_path",
+            detail="PR touches maintainer-owned files: " + ", ".join(protected),
+            label=PROTECTED_PATH_LABEL,
+        )
+
     fp = copycat_guard.fingerprint(diff_text)
     others = [(a, f) for a, f in originals if a != pr.author]
     matched_author, verdict = copycat_guard.worst_verdict(fp, others)
@@ -124,7 +159,8 @@ def process_pr(
     if run_eval is None:
         return GateOutcome(pr.number, "eval_pending",
                            detail="gate chain passed; GPU eval runner is not "
-                                  "wired up yet in this repo (Phase 2)")
+                                  "wired up yet in this repo (Phase 2)",
+                           label=GPU_QUEUE_LABEL)
 
     result = run_eval(pr)
     return GateOutcome(pr.number, "evaluated", detail=json.dumps(result))
@@ -147,19 +183,100 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome) -> None:
         client.post_comment(pr.number,
                             "Please add a filled-in scorecard from "
                             "`python -m eval` (see CONTRIBUTING.md).")
+    elif outcome.action == "protected_path":
+        client.add_label(pr.number, PROTECTED_PATH_LABEL)
+        client.post_comment(
+            pr.number,
+            "This PR touches maintainer-owned files and will not enter the GPU "
+            f"queue: {outcome.detail}. Split miner submissions so scoring "
+            "changes stay outside protected paths.",
+        )
     elif outcome.action == "eval_pending":
+        client.add_label(pr.number, GPU_QUEUE_LABEL)
         client.post_comment(
             pr.number,
             IDEMPOTENCY_MARKER.format(sha=pr.head_sha)
-            + "\nGate chain passed. Automated GPU evaluation is not live in "
-              "this repo yet (tracked as Phase 2 of the update plan).",
+            + "\nGate chain passed. This PR is queued for the next batched "
+              "GPU evaluation window.",
         )
     # skip_draft / already_evaluated / evaluated: nothing to write here.
     # ("evaluated" posts its own scorecard comment from within run_eval /
     # eval.runner once Phase 2 wires that in -- not this function's job.)
 
 
-def run_once(client: GitHubClient, dry_run: bool = True, run_eval=None) -> list:
+def _queue_record(pr: PRInfo, outcome: GateOutcome, position: int | None = None) -> dict:
+    record = {
+        "pr": pr.number,
+        "title": pr.title,
+        "author": pr.author,
+        "head_sha": pr.head_sha,
+        "url": pr.url,
+        "state": outcome.action,
+        "detail": outcome.detail,
+    }
+    if position is not None:
+        record["position"] = position
+    if outcome.label:
+        record["label"] = outcome.label
+    return record
+
+
+def build_queue_dashboard(prs: list[PRInfo], outcomes: list[GateOutcome]) -> dict:
+    """Build the live PR queue feed consumed by dashboard/index.html.
+
+    This is deliberately separate from eval.ledger's sealed-results dashboard:
+    queued PRs are not final evaluations, they are the worklist for the next
+    sequential GPU batch.
+    """
+    by_pr = {o.pr: o for o in outcomes}
+    open_prs = [_queue_record(pr, by_pr[pr.number]) for pr in prs if pr.number in by_pr]
+    queue = [
+        _queue_record(pr, by_pr[pr.number], position=i + 1)
+        for i, pr in enumerate(
+            pr for pr in prs
+            if pr.number in by_pr and by_pr[pr.number].action in GPU_QUEUE_READY_ACTIONS
+        )
+    ]
+    return {
+        "updated": "",
+        "gpu_policy": {
+            "mode": "batched-sequential",
+            "cadence": "one or two maintainer-controlled GPU windows per day",
+            "ready_label": GPU_QUEUE_LABEL,
+        },
+        "queue": queue,
+        "open_prs": open_prs,
+    }
+
+
+def _without_updated(data: dict) -> dict:
+    clean = dict(data)
+    clean.pop("updated", None)
+    return clean
+
+
+def write_queue_dashboard(path: str | Path, data: dict) -> bool:
+    """Write dashboard queue data only when the queue state changed."""
+    p = Path(path)
+    old = None
+    if p.exists():
+        old = json.loads(p.read_text(encoding="utf-8"))
+    if old is not None and _without_updated(old) == _without_updated(data):
+        return False
+
+    out = dict(data)
+    out["updated"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return True
+
+
+def run_once(
+    client: GitHubClient,
+    dry_run: bool = True,
+    run_eval=None,
+    dashboard_data: str | None = None,
+) -> list:
     """Fetch state via ``client``, decide via :func:`process_pr` for every
     open PR (oldest first), then apply the outcome unless ``dry_run``."""
     blocked = load_blocked_contributors()
@@ -184,6 +301,9 @@ def run_once(client: GitHubClient, dry_run: bool = True, run_eval=None) -> list:
 
         if not dry_run:
             _apply(client, pr, outcome)
+
+    if dashboard_data:
+        write_queue_dashboard(dashboard_data, build_queue_dashboard(open_prs, outcomes))
     return outcomes
 
 
@@ -198,10 +318,13 @@ def main(argv=None) -> int:
                    help="actually write labels/comments/close actions back to "
                         "GitHub. Omit this in Phase 1; dry-run is the safe "
                         "default until Phase 3 wires up a live bot identity.")
+    p.add_argument("--dashboard-data",
+                   help="optional path to write the live PR GPU queue feed")
     args = p.parse_args(argv)
 
     client = GitHubClient(args.repo)
-    outcomes = run_once(client, dry_run=not args.write)
+    outcomes = run_once(client, dry_run=not args.write,
+                        dashboard_data=args.dashboard_data)
     for o in outcomes:
         line = f"PR #{o.pr}: {o.action}"
         if o.detail:

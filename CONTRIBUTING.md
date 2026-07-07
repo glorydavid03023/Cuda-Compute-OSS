@@ -81,14 +81,26 @@ compression scheme, a better exact tile schedule in `matmul/`) are welcome too
 Not sure which zone a change falls into? Open the PR anyway — CODEOWNERS
 review routes it correctly.
 
+If a non-maintainer PR touches `eval/`, `docs/`, `.github/`, or
+`dashboard/data.json`, the sensitive-paths guard fails the PR. That is expected:
+those files define the rules, automation, or public score feed. A legitimate
+change there should be split into a maintainer-reviewed PR instead of bundled
+with a miner scoring submission.
+
 ---
 
 ## Self-score locally
 
+CCO uses **uv**. Install the CPU-safe contributor environment first:
+
+```bash
+uv sync --extra test
+```
+
 **Step 0 — a fast, no-GPU sanity check.** Before touching a GPU at all:
 
 ```bash
-python -m strategy.smoke
+uv run python -m strategy.smoke
 ```
 
 This exercises every registered transform's basis on a tiny matrix (shape,
@@ -107,25 +119,26 @@ CCO computes on a **GPU** (CUDA/MPS) via PyTorch — score on a GPU machine
 
 ```bash
 # score your transform on the reference regime (12000, full-rank, 3 couples)
-python -m eval --n 12000 --pairs 3 --transforms mine,rsvd
+uv sync --extra test --extra gpu
+uv run python -m eval --n 12000 --pairs 3 --transforms mine,rsvd
 
 # fit the empirical time complexity O(N^p); pass --rank-m to hold M fixed (~N²),
 # omit it to let M = N//8 grow with N (~N³)
-python -m eval --transforms mine --rank-m 128 --sweep 512,1024,2048
+uv run python -m eval --transforms mine --rank-m 128 --sweep 512,1024,2048
 
 # machine-readable, for pasting exact numbers
-python -m eval --n 12000 --pairs 3 --transforms mine --json
+uv run python -m eval --n 12000 --pairs 3 --transforms mine --json
 
 # if your strategy targets compressible data, show that regime too (and say so):
-python -m eval --n 12000 --pairs 3 --fill lowrank --data-rank 16 --transforms mine
+uv run python -m eval --n 12000 --pairs 3 --fill lowrank --data-rank 16 --transforms mine
 ```
 
 Then confirm you did not break the gates:
 
 ```bash
-python eval/tests/test_eval.py
-python strategy/tests/test_subspace.py
-python tests/test_correctness.py
+uv run python eval/tests/test_eval.py
+uv run python strategy/tests/test_subspace.py
+uv run python tests/test_correctness.py
 ```
 
 Rules for an honest local score:
@@ -192,6 +205,31 @@ correctness gates and the one rule, and merges if your strategy is a genuine
 improvement (or a useful strategy that documents its trade-off honestly). If the
 scorecard can't be reproduced, the PR goes back for evidence — not rejected for
 disagreeing with the prose.
+
+The PR bot runs continuously for non-GPU triage. On each PR event and on a
+15-minute schedule it checks drafts, blocked contributors, copycat overlap, and
+scorecard presence. PRs that pass those gates get `status:queued-gpu` and appear
+in `dashboard/data.json` / `dashboard/index.html` in oldest-PR-first order.
+
+GPU evaluation is intentionally batched. The bot can run all day, but GPU tests
+should run sequentially during one or two maintainer-controlled windows per day.
+That keeps GPU rental predictable while preserving a public queue of what will
+be tested next.
+
+Maintainers can preview the next GPU batch without renting hardware:
+
+```bash
+uv run --extra test python -m eval.gpu_batch --limit 3
+```
+
+When a GPU is available, run the same queue sequentially:
+
+```bash
+uv run --extra test python -m eval.gpu_batch --limit 3 --run --clean
+```
+
+By default the GPU scorer omits `--seed`, so every official run sees fresh
+unseen matrices. Pass `--seed <n>` only to reproduce a prior result.
 
 **Scoring is moving to automated verdict labels** (`eval:XS` through `eval:XL`,
 plus `eval:BASELINE`, `eval:none`, `eval:REJECT` — see
