@@ -71,6 +71,10 @@ class GitHubClient:
         subprocess.run(["gh", "pr", "edit", str(pr_number), "-R", self.repo,
                        "--add-label", label], check=True)
 
+    def remove_label(self, pr_number: int, label: str) -> None:
+        subprocess.run(["gh", "pr", "edit", str(pr_number), "-R", self.repo,
+                       "--remove-label", label], check=False)
+
     def close_pr(self, pr_number: int, reason: str) -> None:
         subprocess.run(["gh", "pr", "close", str(pr_number), "-R", self.repo,
                        "--comment", reason], check=True)

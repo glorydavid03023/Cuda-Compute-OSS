@@ -37,8 +37,8 @@ IDEMPOTENCY_MARKER = "<!-- cco-eval:{sha} -->"
 GPU_QUEUE_LABEL = "status:queued-gpu"
 GPU_QUEUE_READY_ACTIONS = frozenset({"eval_pending", "already_evaluated"})
 PROTECTED_PATH_LABEL = "status:protected-path"
-PROTECTED_PATH_PREFIXES = ("eval/", "docs/", ".github/")
-PROTECTED_PATH_EXACT = frozenset({"dashboard/data.json"})
+PROTECTED_PATH_PREFIXES = ("eval/", "docs/", ".github/", "dashboard/")
+PROTECTED_PATH_EXACT = frozenset()
 
 # Matches .github/workflows/labeler.yml's existing status:needs-scorecard
 # detector exactly (kept as one Python regex so the two never drift): treat

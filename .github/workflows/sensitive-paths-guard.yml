@@ -38,7 +38,7 @@ jobs:
           echo "Changed files:"
           echo "$changed"
 
-          protected_regex='^(eval/|docs/|\.github/|dashboard/data\.json$)'
+          protected_regex='^(eval/|docs/|\.github/|dashboard/)'
           hit="$(echo "$changed" | grep -E "$protected_regex" || true)"
 
           if [ -n "$hit" ]; then

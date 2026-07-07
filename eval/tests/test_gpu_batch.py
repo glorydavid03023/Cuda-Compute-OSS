@@ -6,7 +6,18 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from eval.gpu_batch import EvalSpec, eval_args, load_queue, plan_item, select_batch
+from pathlib import Path
+
+from eval.gpu_batch import (
+    EvalSpec,
+    eval_args,
+    load_queue,
+    mock_result,
+    plan_item,
+    run_item,
+    select_batch,
+    wrap_result,
+)
 
 
 def _queue_file(items):
@@ -73,6 +84,59 @@ def test_plan_contains_sha_check_and_json_output():
         assert "python -m eval" in joined
         assert "--json" in joined
         assert "_results/pr-4-abcdef123456.json" in joined
+    finally:
+        tmp.cleanup()
+
+
+def test_mock_result_has_wrapped_eval_shape():
+    tmp, path = _queue_file([
+        {"pr": 9, "title": "mock me", "author": "alice", "head_sha": "f" * 40,
+         "position": 1},
+    ])
+    try:
+        payload = mock_result(load_queue(path)[0], EvalSpec(transforms="mine"))
+        assert payload["mock"] is True
+        assert payload["eval"]["best"] == "mine"
+        assert payload["eval"]["config"]["device"] == "RTX 5090 (mock)"
+        assert payload["eval"]["transforms"]["mine"]["improvement"] is True
+    finally:
+        tmp.cleanup()
+
+
+def test_wrap_result_adds_pr_metadata():
+    tmp, path = _queue_file([
+        {"pr": 5, "title": "real", "author": "bob", "head_sha": "a" * 40,
+         "position": 1},
+    ])
+    try:
+        item = load_queue(path)[0]
+        payload = wrap_result(item, '{"config": {}, "transforms": {}, "best": null}')
+        assert payload["pr"] == 5
+        assert payload["mock"] is False
+        assert "eval" in payload
+    finally:
+        tmp.cleanup()
+
+
+def test_run_item_mock_writes_result_without_checkout():
+    tmp, path = _queue_file([
+        {"pr": 8, "title": "mock run", "author": "carol", "head_sha": "b" * 40,
+         "position": 1},
+    ])
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            out = run_item(
+                load_queue(path)[0],
+                repo="owner/repo",
+                workdir=Path(d) / "work",
+                results_dir=Path(d) / "results",
+                spec=EvalSpec(transforms="mine"),
+                mock=True,
+            )
+            data = json.loads(out.read_text())
+            assert data["pr"] == 8
+            assert data["eval"]["best"] == "mine"
+            assert not (Path(d) / "work").exists()
     finally:
         tmp.cleanup()
 

@@ -27,10 +27,17 @@ on:
         description: "Optional reproduction seed; leave empty for unseen inputs"
         required: false
         default: ""
+      close_rejected:
+        description: "Close PRs that receive eval:REJECT"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 permissions:
-  contents: read
-  pull-requests: read
+  contents: write
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: gpu-batch-evaluation
@@ -84,3 +91,35 @@ jobs:
           name: gpu-results
           path: gpu-results/*.json
           if-no-files-found: warn
+
+      - name: Apply eval labels and rebuild result dashboard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOSE_REJECTED: ${{ github.event.inputs.close_rejected }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          results=(gpu-results/*.json)
+          if [ ${#results[@]} -eq 0 ]; then
+            echo "No GPU result files to process."
+            exit 0
+          fi
+          args=(--write)
+          if [ "$CLOSE_REJECTED" = "true" ]; then
+            args+=(--close-rejected)
+          fi
+          uv run --extra test python -m eval.result_bot "${results[@]}" \
+            --repo "${{ github.repository }}" \
+            "${args[@]}"
+
+      - name: Commit ledger and dashboard result data if changed
+        run: |
+          if git diff --quiet -- eval/ledger.jsonl dashboard/results.json; then
+            echo "No result data changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add eval/ledger.jsonl dashboard/results.json
+          git commit -m "dashboard: update verified eval results"
+          git push

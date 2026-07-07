@@ -11,6 +11,7 @@ properly isolated self-hosted runner.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from pathlib import Path
 DEFAULT_QUEUE = "dashboard/data.json"
 DEFAULT_WORKDIR = "_gpu_batch_work"
 DEFAULT_RESULTS_DIR = "gpu-results"
+MOCK_GPU_NAME = "RTX 5090 (mock)"
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,81 @@ def eval_args(spec: EvalSpec) -> list[str]:
     return args
 
 
+def result_path(item: QueueItem, results_dir: str | Path) -> Path:
+    return Path(results_dir) / f"pr-{item.pr}-{item.head_sha[:12] or 'unknown'}.json"
+
+
+def _mock_seed(item: QueueItem, spec: EvalSpec) -> int:
+    if spec.seed is not None:
+        return spec.seed
+    material = f"{item.pr}:{item.head_sha}:{spec.n}:{spec.pairs}:{spec.fill}".encode()
+    return int(hashlib.sha256(material).hexdigest()[:8], 16)
+
+
+def mock_result(item: QueueItem, spec: EvalSpec) -> dict:
+    """Produce an evaluate()-shaped result without requiring GPU hardware."""
+    transform = (spec.transforms.split(",")[0].strip() if spec.transforms else "mock_transform")
+    seed = _mock_seed(item, spec)
+    score = 10.0 + (item.pr % 7) / 10.0
+    result = {
+        "accuracy": 0.94,
+        "rel_frobenius_error": 0.06,
+        "latency_s": 0.021 + (item.pr % 3) * 0.002,
+        "peak_vram_bytes": 1_610_612_736,
+        "peak_vram_mib": 1536.0,
+        "flop_ratio_vs_exact": 2.5,
+        "faster_than_exact": True,
+        "less_vram_than_exact": True,
+        "fewer_flops_than_exact": True,
+        "gated": False,
+        "improvement": True,
+        "perf_score": score,
+        "score": score,
+    }
+    return {
+        "pr": item.pr,
+        "title": item.title,
+        "author": item.author,
+        "head_sha": item.head_sha,
+        "url": item.url,
+        "mock": True,
+        "eval": {
+            "config": {
+                "n": spec.n,
+                "pairs": spec.pairs,
+                "dtype": spec.dtype,
+                "rank_m": spec.rank_m,
+                "fill": spec.fill,
+                "accuracy_floor": 0.8,
+                "vram_unit": "gib",
+                "device": MOCK_GPU_NAME,
+                "seed": seed,
+            },
+            "complexity": {"normal": "O(N^3)", "smart": "O(N^2 * M)"},
+            "exact": {
+                "latency_s": 0.052,
+                "peak_vram_bytes": 4_294_967_296,
+                "peak_vram_mib": 4096.0,
+            },
+            "transforms": {transform: result},
+            "ranking": [transform],
+            "best": transform,
+        },
+    }
+
+
+def wrap_result(item: QueueItem, eval_output: str, *, mock: bool = False) -> dict:
+    return {
+        "pr": item.pr,
+        "title": item.title,
+        "author": item.author,
+        "head_sha": item.head_sha,
+        "url": item.url,
+        "mock": mock,
+        "eval": json.loads(eval_output),
+    }
+
+
 def plan_item(
     item: QueueItem,
     *,
@@ -98,7 +175,7 @@ def plan_item(
     spec: EvalSpec,
 ) -> list[str]:
     checkout = Path(workdir) / f"pr-{item.pr}"
-    result = (Path.cwd() / results_dir / f"pr-{item.pr}-{item.head_sha[:12] or 'unknown'}.json")
+    result = (Path.cwd() / result_path(item, results_dir))
     return [
         f"gh repo clone {repo} {checkout}",
         f"cd {checkout} && gh pr checkout {item.pr}",
@@ -135,12 +212,19 @@ def run_item(
     results_dir: str | Path,
     spec: EvalSpec,
     clean: bool = False,
+    mock: bool = False,
 ) -> Path:
     """Execute one queued PR sequentially and return the JSON result path."""
     workdir = Path(workdir)
     results_dir = Path(results_dir)
     checkout = workdir / f"pr-{item.pr}"
-    result = results_dir / f"pr-{item.pr}-{item.head_sha[:12] or 'unknown'}.json"
+    result = result_path(item, results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if mock:
+        result.write_text(json.dumps(mock_result(item, spec), indent=2) + "\n",
+                          encoding="utf-8")
+        return result
 
     if checkout.exists():
         if not clean:
@@ -148,7 +232,6 @@ def run_item(
         shutil.rmtree(checkout)
 
     workdir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
 
     _run(["gh", "repo", "clone", repo, str(checkout)])
     _run(["gh", "pr", "checkout", str(item.pr)], cwd=checkout)
@@ -166,7 +249,8 @@ def run_item(
     _run(["uv", "run", "python", "-m", "strategy.smoke"], cwd=checkout)
 
     completed = _run(eval_args(spec), cwd=checkout, capture=True)
-    result.write_text(completed.stdout, encoding="utf-8")
+    result.write_text(json.dumps(wrap_result(item, completed.stdout), indent=2) + "\n",
+                      encoding="utf-8")
     return result
 
 
@@ -183,6 +267,8 @@ def main(argv=None) -> int:
                         help="number of queued PRs to evaluate; <=0 means all")
     parser.add_argument("--run", action="store_true",
                         help="execute the batch. Omit for a dry-run plan.")
+    parser.add_argument("--mock", action="store_true",
+                        help="with --run, write mock RTX 5090 result JSON without gh/GPU")
     parser.add_argument("--clean", action="store_true",
                         help="replace existing per-PR checkout directories")
     parser.add_argument("--n", type=int, default=12000)
@@ -224,6 +310,7 @@ def main(argv=None) -> int:
                 results_dir=args.results_dir,
                 spec=spec,
                 clean=args.clean,
+                mock=args.mock,
             )
             print(f"  wrote {result}")
         else:
