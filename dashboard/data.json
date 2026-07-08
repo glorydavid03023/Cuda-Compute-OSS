@@ -113,8 +113,20 @@
       "state": "non_gpu_review",
       "title": "fix(strategy): correct advertised default M to min(n, max(64, n//8))",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/118"
+    },
+    {
+      "author": "boskodev790",
+      "detail": "matches an earlier PR by luciferlive112116: 100% of added lines already appear in an earlier PR",
+      "gpu_required": false,
+      "head_sha": "fd22d14e4429d5c5df6b84ea40813021be2148de",
+      "kind": "docs",
+      "label": "copycat",
+      "pr": 119,
+      "state": "copycat_block",
+      "title": "docs(matmul): recompute FLOP table cells with decimal n",
+      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/119"
     }
   ],
   "queue": [],
-  "updated": "2026-07-08T15:34:08+00:00"
+  "updated": "2026-07-08T15:36:08+00:00"
 }
