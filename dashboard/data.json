@@ -10,15 +10,14 @@
   "open_prs": [
     {
       "author": "RealDiligent",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
+      "detail": "Commit history contains a Co-authored-by footer for a coding agent (for example Cursor, Codex, Claude, Copilot, or similar). CCO does not accept coding-agent co-author footers.",
       "gpu_required": false,
       "head_sha": "d9adcd9d6624be952fb23eb85a8d900a398c3bd3",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
+      "kind": null,
       "pr": 112,
-      "state": "non_gpu_review",
+      "state": "close_coding_agent_coauthor",
       "title": "fix(strategy): stream K tiles in multiply_exact for memmap inputs",
-      "updated_at": "2026-07-09T20:58:55Z",
+      "updated_at": "2026-07-09T21:09:29Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/112"
     },
     {
@@ -31,10 +30,10 @@
       "pr": 127,
       "state": "non_gpu_review",
       "title": "fix(strategy): delegate CPUBackend.host_available_bytes to shared cross-platform helper",
-      "updated_at": "2026-07-09T21:08:28Z",
+      "updated_at": "2026-07-09T21:09:36Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/127"
     }
   ],
   "queue": [],
-  "updated": "2026-07-09T21:09:40+00:00"
+  "updated": "2026-07-09T22:40:48+00:00"
 }
