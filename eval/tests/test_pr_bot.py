@@ -9,12 +9,14 @@ orchestration layer with a fake in-memory GitHub, never real `gh` calls.
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from eval import copycat_guard
 from eval.pr_bot import (
     GPU_QUEUE_LABEL,
+    MAX_OPEN_PRS_PER_AUTHOR,
     NEEDS_PR_KIND_LABEL,
     NEEDS_SCORECARD_MARKER,
     PROTECTED_PATH_LABEL,
@@ -25,7 +27,9 @@ from eval.pr_bot import (
     already_notified,
     build_queue_dashboard,
     changed_files,
+    excess_open_prs,
     has_scorecard,
+    merge_conflict_comment_time,
     process_pr,
     run_once,
     protected_paths,
@@ -66,9 +70,21 @@ diff --git a/eval/evaluator.py b/eval/evaluator.py
 """
 
 
-def _pr(number=1, author="alice", is_draft=False, head_sha="sha1", body=SCORECARD_BODY):
+def _pr(
+    number=1,
+    author="alice",
+    is_draft=False,
+    head_sha="sha1",
+    body=SCORECARD_BODY,
+    updated_at="2026-07-10T00:00:00Z",
+    merge_state_status="CLEAN",
+    mergeable="MERGEABLE",
+):
     return PRInfo(number=number, title=f"feat: PR {number}", author=author,
-                 is_draft=is_draft, head_sha=head_sha, body=body)
+                 is_draft=is_draft, head_sha=head_sha, body=body,
+                 updated_at=updated_at,
+                 merge_state_status=merge_state_status,
+                 mergeable=mergeable)
 
 
 def test_draft_is_skipped():
@@ -79,6 +95,34 @@ def test_draft_is_skipped():
 def test_blocked_contributor_is_closed():
     out = process_pr(_pr(author="badactor"), SOME_DIFF, [], frozenset({"badactor"}), [])
     assert out.action == "close_blocked"
+
+
+def test_process_pr_closes_excess_open_pr():
+    pr = _pr(number=1, author="alice")
+    out = process_pr(pr, SOME_DIFF, [], frozenset(), [], frozenset({1}))
+    assert out.action == "close_excess_open_pr"
+    assert str(MAX_OPEN_PRS_PER_AUTHOR) in out.detail
+
+
+def test_merge_conflict_without_prior_comment_requests_resolution():
+    pr = _pr(number=1, merge_state_status="DIRTY", mergeable="CONFLICTING")
+    out = process_pr(pr, SOME_DIFF, [], frozenset(), [])
+    assert out.action == "needs_merge_conflict_resolution"
+
+
+def test_merge_conflict_closes_after_grace_window():
+    pr = _pr(number=1, head_sha="sha1", merge_state_status="DIRTY", mergeable="CONFLICTING")
+    warned_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    marker = f"<!-- cco-merge-conflict:sha1:{warned_at.isoformat()} -->"
+    out = process_pr(
+        pr,
+        SOME_DIFF,
+        [marker],
+        frozenset(),
+        [],
+        now=warned_at + timedelta(hours=12, minutes=1),
+    )
+    assert out.action == "close_stale_merge_conflict"
 
 
 def test_changed_files_from_diff():
@@ -177,6 +221,31 @@ def test_already_queued_helper():
 def test_already_notified_helper():
     assert already_notified(["x", "<!-- cco-needs-scorecard:abc -->"], NEEDS_SCORECARD_MARKER, "abc")
     assert not already_notified(["x"], NEEDS_SCORECARD_MARKER, "abc")
+
+
+def test_merge_conflict_comment_time_ignores_other_heads_and_picks_latest():
+    comments = [
+        "<!-- cco-merge-conflict:sha0:2026-07-10T01:00:00+00:00 -->",
+        "<!-- cco-merge-conflict:sha1:2026-07-10T02:00:00+00:00 -->",
+        "<!-- cco-merge-conflict:sha1:2026-07-10T03:00:00+00:00 -->",
+    ]
+    when = merge_conflict_comment_time(comments, "sha1")
+    assert when == datetime(2026, 7, 10, 3, 0, tzinfo=timezone.utc)
+
+
+def test_excess_open_prs_keeps_two_oldest_prs_per_author():
+    pr1 = _pr(number=1, author="alice", updated_at="2026-07-10T08:00:00Z")
+    pr2 = _pr(number=2, author="alice", updated_at="2026-07-10T09:00:00Z")
+    pr3 = _pr(number=3, author="alice", updated_at="2026-07-10T10:00:00Z")
+    pr4 = _pr(number=4, author="bob", updated_at="2026-07-10T07:00:00Z")
+    assert excess_open_prs([pr1, pr2, pr3, pr4]) == frozenset({3})
+
+
+def test_excess_open_prs_ignores_recent_updates_and_closes_newer_prs():
+    pr1 = _pr(number=1, author="alice", updated_at="2026-07-10T11:00:00Z")
+    pr2 = _pr(number=2, author="alice", updated_at="2026-07-10T09:00:00Z")
+    pr3 = _pr(number=3, author="alice", updated_at="2026-07-10T10:00:00Z")
+    assert excess_open_prs([pr1, pr2, pr3]) == frozenset({3})
 
 
 class FakeClient:
@@ -288,6 +357,43 @@ def test_run_once_live_mode_does_not_repeat_queue_comment():
     assert not any(a[0] == "post_comment" for a in client.actions)
 
 
+def test_run_once_live_mode_comments_once_for_merge_conflict():
+    pr1 = _pr(number=1, head_sha="sha1", merge_state_status="DIRTY", mergeable="CONFLICTING")
+    client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: SOME_DIFF})
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "needs_merge_conflict_resolution"
+    comments = [a for a in client.actions if a[0] == "post_comment"]
+    assert len(comments) == 1
+    assert "resolve them within 12 hours" in comments[0][2]
+
+
+def test_run_once_live_mode_does_not_repeat_merge_conflict_comment_for_same_head():
+    pr1 = _pr(number=1, head_sha="sha1", merge_state_status="DIRTY", mergeable="CONFLICTING")
+    marker = "<!-- cco-merge-conflict:sha1:2026-07-10T02:00:00+00:00 -->"
+    client = FakeClient(
+        prs={"all": [pr1], "open": [pr1]},
+        diffs={1: SOME_DIFF},
+        comments={1: [marker]},
+    )
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "needs_merge_conflict_resolution"
+    assert not any(a[0] == "post_comment" for a in client.actions)
+
+
+def test_run_once_live_mode_closes_stale_merge_conflict_after_12_hours():
+    pr1 = _pr(number=1, head_sha="sha1", merge_state_status="DIRTY", mergeable="CONFLICTING")
+    stale = (datetime.now(timezone.utc) - timedelta(hours=12, minutes=5)).replace(microsecond=0)
+    marker = f"<!-- cco-merge-conflict:sha1:{stale.isoformat()} -->"
+    client = FakeClient(
+        prs={"all": [pr1], "open": [pr1]},
+        diffs={1: SOME_DIFF},
+        comments={1: [marker]},
+    )
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "close_stale_merge_conflict"
+    assert ("close_pr", 1, outcomes[0].detail) in client.actions
+
+
 def test_run_once_live_mode_clears_queue_label_once_already_evaluated():
     pr1 = _pr(number=1, author="alice", head_sha="sha1", body=SCORECARD_BODY)
     client = FakeClient(
@@ -319,6 +425,24 @@ def test_run_once_live_mode_labels_protected_path():
     assert ("add_label", 1, PROTECTED_PATH_LABEL) in client.actions
 
 
+def test_run_once_live_mode_closes_older_prs_when_author_exceeds_cap():
+    pr1 = _pr(number=1, author="alice", updated_at="2026-07-10T08:00:00Z")
+    pr2 = _pr(number=2, author="alice", updated_at="2026-07-10T09:00:00Z")
+    pr3 = _pr(number=3, author="alice", updated_at="2026-07-10T10:00:00Z")
+    client = FakeClient(
+        prs={"all": [pr1, pr2, pr3], "open": [pr1, pr2, pr3]},
+        diffs={1: SOME_DIFF, 2: SOME_DIFF, 3: SOME_DIFF},
+    )
+    outcomes = run_once(client, dry_run=False)
+    by_pr = {out.pr: out for out in outcomes}
+    assert by_pr[1].action == "eval_pending"
+    assert by_pr[2].action == "eval_pending"
+    assert by_pr[3].action == "close_excess_open_pr"
+    assert ("close_pr", 3, by_pr[3].detail) in client.actions
+    assert ("add_label", 1, GPU_QUEUE_LABEL) in client.actions
+    assert ("add_label", 2, GPU_QUEUE_LABEL) in client.actions
+
+
 def test_run_once_originals_include_prs_between_two_open_ones():
     # A merged PR #2 sits between open PRs #1 and #3; #3 copying #2 must be
     # caught even though #2 itself is never "open".
@@ -337,11 +461,13 @@ def test_run_once_originals_include_prs_between_two_open_ones():
     assert pr3_outcome.action == "copycat_block", pr3_outcome
 
 
-def test_queue_dashboard_orders_ready_prs_oldest_first():
-    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
+def test_queue_dashboard_orders_ready_prs_by_oldest_update_first():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY,
+              updated_at="2026-07-10T08:00:00Z")
     pr2 = PRInfo(number=2, title="fix: PR 2", author="bob", is_draft=False, head_sha="sha1",
-                 body=NO_SCORECARD_BODY)
-    pr3 = _pr(number=3, author="carol", body=SCORECARD_BODY)
+                 body=NO_SCORECARD_BODY, updated_at="2026-07-10T07:00:00Z")
+    pr3 = _pr(number=3, author="carol", body=SCORECARD_BODY,
+              updated_at="2026-07-10T09:00:00Z")
     outcomes = [
         process_pr(pr1, SOME_DIFF, [], frozenset(), []),
         process_pr(pr2, SOME_DIFF, [], frozenset(), []),
@@ -351,6 +477,21 @@ def test_queue_dashboard_orders_ready_prs_oldest_first():
     assert [item["pr"] for item in data["queue"]] == [1, 3]
     assert [item["position"] for item in data["queue"]] == [1, 2]
     assert len(data["open_prs"]) == 3
+
+
+def test_queue_dashboard_resorts_when_pr_is_updated():
+    pr1 = _pr(number=1, updated_at="2026-07-10T08:00:00Z")
+    pr2 = _pr(number=2, updated_at="2026-07-10T09:00:00Z")
+    outcomes = [
+        process_pr(pr1, SOME_DIFF, [], frozenset(), []),
+        process_pr(pr2, SOME_DIFF, [], frozenset(), []),
+    ]
+    data = build_queue_dashboard([pr1, pr2], outcomes)
+    assert [item["pr"] for item in data["queue"]] == [1, 2]
+
+    pr1_updated = _pr(number=1, updated_at="2026-07-10T10:00:00Z")
+    data = build_queue_dashboard([pr1_updated, pr2], outcomes)
+    assert [item["pr"] for item in data["queue"]] == [2, 1]
 
 
 def test_queue_dashboard_write_skips_timestamp_only_churn():

@@ -237,6 +237,12 @@ and does not put a PR into the GPU queue.
    is detected automatically and blocked (see
    [`.github/COPYCATS.md`](.github/COPYCATS.md)) — an independently-arrived-at
    similar solution is fine, a copy is not.
+7. **Keep your queue small.** A miner may have at most **2 open PRs** at once.
+   If you open a third, the bot keeps the **two oldest** open PRs and closes
+   the newer overflow PR automatically.
+8. **Resolve merge conflicts promptly.** If GitHub reports a merge conflict,
+   the bot comments once on that conflicted head SHA. If the conflict is still
+   unresolved **12 hours** later, the bot closes the PR automatically.
 
 If you are coming in through Gittensor, contribute through the same GitHub path
 as everyone else: code in a branch, benchmark locally, and submit a PR with
@@ -311,6 +317,12 @@ lane declaration, and scorecard presence when the lane is `feat`.
   oldest-PR-first order.
 - attention prototype PRs do not enter the GPU queue until the official
   attention track is implemented.
+- each miner may keep only **2 open PRs**. If a third or later PR is opened,
+  the bot closes the newer overflow PRs and keeps the two oldest open ones.
+- a PR with GitHub-reported merge conflicts is temporarily blocked from normal
+  routing. The bot posts one resolve-conflict reminder for the current head SHA.
+  If that same conflicted SHA is still open **12 hours** later, the bot closes
+  the PR automatically.
 
 The dashboard UI itself is expected to live in a separate private repository,
 so `main` stays protected while the bot publishes queue/result data to that

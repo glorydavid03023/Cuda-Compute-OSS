@@ -24,6 +24,9 @@ class PRInfo:
     body: str = ""
     url: str = ""
     labels: tuple[str, ...] = ()
+    updated_at: str = ""
+    merge_state_status: str = ""
+    mergeable: str = ""
 
 
 class GitHubClient:
@@ -37,26 +40,34 @@ class GitHubClient:
 
     def list_prs(self, state: str = "open") -> list:
         out = self._run("pr", "list", "--state", state, "-L", "300", "--json",
-                        "number,title,author,isDraft,headRefOid,body,url,labels")
+                        "number,title,author,isDraft,headRefOid,body,url,labels,updatedAt,"
+                        "mergeStateStatus,mergeable")
         data = json.loads(out)
         return [
             PRInfo(number=d["number"], title=d["title"],
                    author=d["author"]["login"], is_draft=d["isDraft"],
                    head_sha=d["headRefOid"], body=d.get("body") or "",
                    url=d.get("url") or "",
-                   labels=tuple(lbl["name"] for lbl in d.get("labels", [])))
+                   labels=tuple(lbl["name"] for lbl in d.get("labels", [])),
+                   updated_at=d.get("updatedAt") or "",
+                   merge_state_status=d.get("mergeStateStatus") or "",
+                   mergeable=d.get("mergeable") or "")
             for d in data
         ]
 
     def get_pr(self, pr_number: int) -> PRInfo:
         out = self._run("pr", "view", str(pr_number), "--json",
-                        "number,title,author,isDraft,headRefOid,body,url,labels")
+                        "number,title,author,isDraft,headRefOid,body,url,labels,updatedAt,"
+                        "mergeStateStatus,mergeable")
         d = json.loads(out)
         return PRInfo(number=d["number"], title=d["title"],
                       author=d["author"]["login"], is_draft=d["isDraft"],
                       head_sha=d["headRefOid"], body=d.get("body") or "",
                       url=d.get("url") or "",
-                      labels=tuple(lbl["name"] for lbl in d.get("labels", [])))
+                      labels=tuple(lbl["name"] for lbl in d.get("labels", [])),
+                      updated_at=d.get("updatedAt") or "",
+                      merge_state_status=d.get("mergeStateStatus") or "",
+                      mergeable=d.get("mergeable") or "")
 
     def get_diff(self, pr_number: int) -> str:
         return self._run("pr", "diff", str(pr_number))

@@ -26,7 +26,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import copycat_guard
@@ -37,12 +37,17 @@ BLOCKED_CONTRIBUTORS_PATH = ".github/blocked-contributors.txt"
 IDEMPOTENCY_MARKER = "<!-- cco-eval:{sha} -->"
 NEEDS_SCORECARD_MARKER = "<!-- cco-needs-scorecard:{sha} -->"
 NEEDS_PR_KIND_MARKER = "<!-- cco-needs-pr-kind:{sha} -->"
+MERGE_CONFLICT_MARKER_RE = re.compile(
+    r"<!--\s*cco-merge-conflict:(?P<sha>[0-9A-Za-z._-]+):(?P<ts>[^ >]+)\s*-->"
+)
 RESULT_MARKER_PREFIX = "<!-- cco-result:{pr}:"
 GPU_QUEUE_LABEL = "status:queued-gpu"
 GPU_QUEUE_READY_ACTIONS = frozenset({"eval_pending"})
 READY_NON_GPU_LABEL = "status:ready-non-gpu"
 NEEDS_PR_KIND_LABEL = "status:needs-pr-kind"
 PROTECTED_PATH_LABEL = "status:protected-path"
+MAX_OPEN_PRS_PER_AUTHOR = 2
+MERGE_CONFLICT_GRACE = timedelta(hours=12)
 PROTECTED_PATH_PREFIXES = ("eval/", "docs/", ".github/", "dashboard/")
 PROTECTED_PATH_EXACT = frozenset()
 FEATURE_KIND_LABELS = frozenset({"type:feature", "type:strategy", "type:enhancement"})
@@ -111,6 +116,31 @@ def already_notified(comments: list, marker: str, head_sha: str) -> bool:
 def already_evaluated(pr_number: int, comments: list) -> bool:
     marker = RESULT_MARKER_PREFIX.format(pr=pr_number)
     return any(marker in c for c in comments)
+
+
+def _parse_iso8601(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def merge_conflict_comment_time(comments: list, head_sha: str) -> datetime | None:
+    latest = None
+    for body in comments:
+        for match in MERGE_CONFLICT_MARKER_RE.finditer(body or ""):
+            if match.group("sha") != head_sha:
+                continue
+            try:
+                when = _parse_iso8601(match.group("ts"))
+            except ValueError:
+                continue
+            if latest is None or when > latest:
+                latest = when
+    return latest
+
+
+def has_merge_conflict(pr: PRInfo) -> bool:
+    status = (pr.merge_state_status or "").upper()
+    mergeable = (pr.mergeable or "").upper()
+    return status == "DIRTY" or mergeable == "CONFLICTING"
 
 
 def has_scorecard(body: str) -> bool:
@@ -202,12 +232,36 @@ def classify_pr(pr: PRInfo, diff_text: str) -> str:
     return "unknown"
 
 
+def excess_open_prs(prs: list[PRInfo], limit: int = MAX_OPEN_PRS_PER_AUTHOR) -> frozenset[int]:
+    """Return PR numbers that exceed the per-author open-PR cap.
+
+    The bot keeps the oldest ``limit`` open PRs per author and closes newer
+    overflow PRs. PR number order matches GitHub creation order, so a miner
+    cannot keep opening fresh PRs while older ones are still awaiting review.
+    """
+    if limit <= 0:
+        return frozenset()
+
+    by_author: dict[str, list[PRInfo]] = {}
+    for pr in prs:
+        by_author.setdefault(pr.author, []).append(pr)
+
+    overflow = set()
+    for author_prs in by_author.values():
+        ranked = sorted(author_prs, key=lambda pr: pr.number)
+        for pr in ranked[limit:]:
+            overflow.add(pr.number)
+    return frozenset(overflow)
+
+
 def process_pr(
     pr: PRInfo,
     diff_text: str,
     comments: list,
     blocked: frozenset,
     originals: list,
+    excess_pr_numbers: frozenset[int] = frozenset(),
+    now: datetime | None = None,
     run_eval=None,
 ) -> GateOutcome:
     """Decide the gate-chain outcome for one PR. Pure: takes already-fetched
@@ -219,16 +273,51 @@ def process_pr(
     run_eval  : callable(pr) -> dict, or None (Phase 1's stub -- gate chain
                 passed but there is no GPU runner wired up yet).
 
-    action values: skip_draft, close_blocked, copycat_block, copycat_warn,
+    action values: skip_draft, close_blocked, close_excess_open_pr,
+    needs_merge_conflict_resolution, close_stale_merge_conflict,
+    copycat_block, copycat_warn,
     already_evaluated, needs_pr_kind, needs_scorecard, non_gpu_review,
     eval_pending, evaluated.
     """
+    now = now or datetime.now(timezone.utc)
+
     if pr.is_draft:
         return GateOutcome(pr.number, "skip_draft")
 
     if pr.author in blocked:
         return GateOutcome(pr.number, "close_blocked",
                            detail=f"{pr.author} is on the blocked-contributors list")
+
+    if pr.number in excess_pr_numbers:
+        return GateOutcome(
+            pr.number,
+            "close_excess_open_pr",
+            detail=f"{pr.author} already has more than {MAX_OPEN_PRS_PER_AUTHOR} open PRs; "
+                   "closing this newer PR and keeping only the two oldest open ones.",
+        )
+
+    if has_merge_conflict(pr):
+        warned_at = merge_conflict_comment_time(comments, pr.head_sha)
+        if warned_at is None:
+            return GateOutcome(
+                pr.number,
+                "needs_merge_conflict_resolution",
+                detail="This PR has merge conflicts with the base branch. Resolve them within "
+                       "12 hours or the bot will close the PR automatically.",
+            )
+        if now - warned_at >= MERGE_CONFLICT_GRACE:
+            return GateOutcome(
+                pr.number,
+                "close_stale_merge_conflict",
+                detail="Closing this PR because the reported merge conflict was not resolved "
+                       "within 12 hours of the bot reminder.",
+            )
+        return GateOutcome(
+            pr.number,
+            "needs_merge_conflict_resolution",
+            detail="This PR still has merge conflicts with the base branch. Resolve them within "
+                   "12 hours of the bot reminder to keep it open.",
+        )
 
     protected = protected_paths(diff_text)
     if protected:
@@ -296,6 +385,23 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome, comments: lis
     """Perform the write action implied by ``outcome``. Only called from
     :func:`run_once` when ``dry_run=False`` -- not the default in Phase 1."""
     if outcome.action == "close_blocked":
+        client.close_pr(pr.number, outcome.detail)
+    elif outcome.action == "close_excess_open_pr":
+        client.close_pr(pr.number, outcome.detail)
+    elif outcome.action == "needs_merge_conflict_resolution":
+        if merge_conflict_comment_time(comments, pr.head_sha) is None:
+            stamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            client.post_comment(
+                pr.number,
+                f"<!-- cco-merge-conflict:{pr.head_sha}:{stamp} -->\n"
+                "This PR currently has merge conflicts with the base branch. "
+                "Please resolve them within 12 hours or the bot will close the PR automatically.",
+            )
+        client.remove_label(pr.number, GPU_QUEUE_LABEL)
+        client.remove_label(pr.number, READY_NON_GPU_LABEL)
+        client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
+        client.remove_label(pr.number, "status:needs-scorecard")
+    elif outcome.action == "close_stale_merge_conflict":
         client.close_pr(pr.number, outcome.detail)
     elif outcome.action == "copycat_block":
         client.add_label(pr.number, "copycat")
@@ -374,6 +480,7 @@ def _queue_record(pr: PRInfo, outcome: GateOutcome, position: int | None = None)
         "author": pr.author,
         "head_sha": pr.head_sha,
         "url": pr.url,
+        "updated_at": pr.updated_at,
         "kind": outcome.kind,
         "gpu_required": outcome.kind == "feat",
         "state": outcome.action,
@@ -395,12 +502,16 @@ def build_queue_dashboard(prs: list[PRInfo], outcomes: list[GateOutcome]) -> dic
     """
     by_pr = {o.pr: o for o in outcomes}
     open_prs = [_queue_record(pr, by_pr[pr.number]) for pr in prs if pr.number in by_pr]
-    queue = [
-        _queue_record(pr, by_pr[pr.number], position=i + 1)
-        for i, pr in enumerate(
+    ready_prs = sorted(
+        (
             pr for pr in prs
             if pr.number in by_pr and by_pr[pr.number].action in GPU_QUEUE_READY_ACTIONS
-        )
+        ),
+        key=lambda pr: (pr.updated_at or "", pr.number),
+    )
+    queue = [
+        _queue_record(pr, by_pr[pr.number], position=i + 1)
+        for i, pr in enumerate(ready_prs)
     ]
     return {
         "updated": "",
@@ -447,7 +558,9 @@ def run_once(
     open PR (oldest first), then apply the outcome unless ``dry_run``."""
     blocked = load_blocked_contributors()
     all_prs = sorted(client.list_prs("all"), key=lambda p: p.number)
-    open_prs = sorted(client.list_prs("open"), key=lambda p: p.number)
+    open_prs = sorted(client.list_prs("open"), key=lambda p: (p.updated_at or "", p.number))
+    excess_pr_numbers = excess_open_prs(open_prs)
+    now = datetime.now(timezone.utc)
 
     diff_by_pr = {}
     fp_by_pr = {}
@@ -462,7 +575,16 @@ def run_once(
         # Every earlier PR (any state -- open, closed, or merged) is a valid
         # copycat comparison target; PR number order is creation order.
         originals = [(p.author, fp_by_pr[p.number]) for p in all_prs if p.number < pr.number]
-        outcome = process_pr(pr, diff, comments, blocked, originals, run_eval)
+        outcome = process_pr(
+            pr,
+            diff,
+            comments,
+            blocked,
+            originals,
+            excess_pr_numbers,
+            now,
+            run_eval,
+        )
         outcomes.append(outcome)
 
         if not dry_run:
