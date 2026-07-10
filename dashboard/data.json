@@ -18,10 +18,22 @@
       "pr": 127,
       "state": "non_gpu_review",
       "title": "fix(strategy): delegate CPUBackend.host_available_bytes to shared cross-platform helper",
-      "updated_at": "2026-07-09T23:23:29Z",
+      "updated_at": "2026-07-09T23:52:30Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/127"
+    },
+    {
+      "author": "RealDiligent",
+      "detail": "Commit history contains a Co-authored-by footer for a coding agent (for example Cursor, Codex, Claude, Copilot, or similar). CCO does not accept coding-agent co-author footers.",
+      "gpu_required": false,
+      "head_sha": "c10741688fa665ec89764989bfa3777bfeb53eef",
+      "kind": null,
+      "pr": 129,
+      "state": "close_coding_agent_coauthor",
+      "title": "fix(strategy): reserve Q/Ctil VRAM in subspace row-block budgeting",
+      "updated_at": "2026-07-10T02:00:19Z",
+      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/129"
     }
   ],
   "queue": [],
-  "updated": "2026-07-09T23:52:33+00:00"
+  "updated": "2026-07-10T02:01:56+00:00"
 }
