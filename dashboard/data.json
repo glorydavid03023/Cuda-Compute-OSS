@@ -9,18 +9,6 @@
   },
   "open_prs": [
     {
-      "author": "jony376",
-      "detail": "PR touches maintainer-owned files: eval/evaluator.py, eval/tests/test_eval.py. Miner PRs cannot modify maintainer-owned files. Open a fresh PR that only changes allowed miner-owned files.",
-      "gpu_required": false,
-      "head_sha": "b8b6699e122d87ea3a3a4a5f04faac0eaaed0231",
-      "kind": null,
-      "pr": 149,
-      "state": "close_protected_path",
-      "title": "fix(eval): keep perf_score ungated for JSON transparency",
-      "updated_at": "2026-07-10T12:52:23Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/149"
-    },
-    {
       "author": "joaovictor91123",
       "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
       "gpu_required": false,
@@ -30,7 +18,7 @@
       "pr": 146,
       "state": "non_gpu_review",
       "title": "fix(strategy): budget multiply_exact's GEMM output and accumulate in place (Fixes #144)",
-      "updated_at": "2026-07-10T12:53:02Z",
+      "updated_at": "2026-07-10T12:58:25Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/146"
     },
     {
@@ -43,7 +31,7 @@
       "pr": 137,
       "state": "non_gpu_review",
       "title": "fix(strategy): state the real default M = min(n, max(64, n//8)) (Fixes #98)",
-      "updated_at": "2026-07-10T12:53:09Z",
+      "updated_at": "2026-07-10T12:58:32Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/137"
     },
     {
@@ -56,10 +44,10 @@
       "pr": 151,
       "state": "non_gpu_review",
       "title": "fix(attention): run spectral_global_mix FFT in fp32 so the default fp16 benchmark does not crash",
-      "updated_at": "2026-07-10T12:56:32Z",
+      "updated_at": "2026-07-10T12:58:40Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/151"
     }
   ],
   "queue": [],
-  "updated": "2026-07-10T12:58:46+00:00"
+  "updated": "2026-07-10T13:00:46+00:00"
 }
