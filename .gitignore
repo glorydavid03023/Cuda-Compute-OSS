@@ -29,6 +29,9 @@ gpu-results/
 docs/phase-3-4-plan.md
 docs/sn74-emission-strategy.md
 
+# Claude Code — local maintainer tooling, review heuristics, private notes
+.claude/
+
 # OS / editor
 .DS_Store
 *.swp
