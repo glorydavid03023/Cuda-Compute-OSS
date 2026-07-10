@@ -214,10 +214,11 @@ the contribution loop is:
   Codex, Claude, Copilot, or similar tools; the bot auto-closes PRs with those
   commit footers
 - keep at most **2 open PRs** per miner; newer overflow PRs are auto-closed by the bot
-- resolve bot-requested blocking changes quickly. Missing PR kind, missing feat
-  scorecard, protected-path edits, and merge conflicts get one bot reminder for
-  the current head SHA; if the same head SHA is still unfixed after **12 hours**,
-  the bot closes the PR automatically.
+- declare PR kind, include a scorecard for `feat` PRs, and avoid protected
+  paths; missing kind, missing `feat` scorecard, or protected-path edits are
+  closed immediately by the bot
+- resolve merge conflicts and maintainer "changes requested" reviews with a
+  new commit within **12 hours**, or the bot closes the PR automatically
 
 ## Repository Layout
 

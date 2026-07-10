@@ -15,27 +15,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from eval import copycat_guard
 from eval.pr_bot import (
+    CHANGES_REQUESTED_LABEL,
     GPU_QUEUE_LABEL,
     MAX_OPEN_PRS_PER_AUTHOR,
-    NEEDS_PR_KIND_LABEL,
-    NEEDS_SCORECARD_MARKER,
-    PROTECTED_PATH_LABEL,
     READY_NON_GPU_LABEL,
     PRInfo,
     already_evaluated,
     already_queued,
-    already_notified,
-    blocking_change_comment_time,
     build_queue_dashboard,
     changed_files,
     excess_open_prs,
     has_coding_agent_coauthor,
     has_scorecard,
+    latest_maintainer_change_request,
     merge_conflict_comment_time,
     process_pr,
     run_once,
     protected_paths,
     write_queue_dashboard,
+    ReviewInfo,
 )
 
 # Matches .github/workflows/labeler.yml's status:needs-scorecard detector
@@ -159,6 +157,22 @@ def test_merge_conflict_closes_after_grace_window():
     assert out.action == "close_stale_merge_conflict"
 
 
+def test_maintainer_hold_label_prevents_stale_merge_conflict_close():
+    pr = _pr(number=1, head_sha="sha1", merge_state_status="DIRTY", mergeable="CONFLICTING")
+    pr.labels = ("status:maintainer-review",)
+    warned_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    marker = f"<!-- cco-merge-conflict:sha1:{warned_at.isoformat()} -->"
+    out = process_pr(
+        pr,
+        SOME_DIFF,
+        [marker],
+        frozenset(),
+        [],
+        now=warned_at + timedelta(hours=12, minutes=1),
+    )
+    assert out.action == "needs_merge_conflict_resolution"
+
+
 def test_changed_files_from_diff():
     assert changed_files(SOME_DIFF) == frozenset({"strategy/transforms.py"})
 
@@ -167,10 +181,10 @@ def test_protected_paths_are_detected():
     assert protected_paths(PROTECTED_DIFF) == ("eval/evaluator.py",)
 
 
-def test_protected_path_is_not_queued():
+def test_protected_path_is_closed_immediately():
     out = process_pr(_pr(author="alice"), PROTECTED_DIFF, [], frozenset(), [])
-    assert out.action == "protected_path"
-    assert out.label == PROTECTED_PATH_LABEL
+    assert out.action == "close_protected_path"
+    assert "maintainer-owned files" in out.detail
 
 
 def test_unknown_pr_kind_is_flagged():
@@ -178,8 +192,7 @@ def test_unknown_pr_kind_is_flagged():
                 body="Just some changes.")
     out = process_pr(pr, "diff --git a/matmul/x.py b/matmul/x.py\n+++ b/matmul/x.py\n+pass\n",
                      [], frozenset(), [])
-    assert out.action == "needs_pr_kind"
-    assert out.label == NEEDS_PR_KIND_LABEL
+    assert out.action == "close_missing_pr_kind"
 
 
 def test_fix_pr_does_not_require_gpu_scorecard():
@@ -215,55 +228,7 @@ def test_queue_marker_keeps_pr_in_eval_pending_state():
 
 def test_missing_scorecard_is_flagged():
     out = process_pr(_pr(body=NO_SCORECARD_BODY), SOME_DIFF, [], frozenset(), [])
-    assert out.action == "needs_scorecard"
-    assert out.label == "status:needs-scorecard"
-
-
-def test_stale_missing_scorecard_closes_after_grace_window():
-    pr = _pr(number=1, head_sha="sha1", body=NO_SCORECARD_BODY)
-    warned_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
-    marker = f"<!-- cco-blocking-change:scorecard:sha1:{warned_at.isoformat()} -->"
-    out = process_pr(
-        pr,
-        SOME_DIFF,
-        [marker],
-        frozenset(),
-        [],
-        now=warned_at + timedelta(hours=12, minutes=1),
-    )
-    assert out.action == "close_stale_blocking_request"
-    assert "scorecard" in out.detail
-
-
-def test_blocking_change_timer_resets_on_new_head_sha():
-    pr = _pr(number=1, head_sha="sha2", body=NO_SCORECARD_BODY)
-    warned_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
-    old_marker = f"<!-- cco-blocking-change:scorecard:sha1:{warned_at.isoformat()} -->"
-    out = process_pr(
-        pr,
-        SOME_DIFF,
-        [old_marker],
-        frozenset(),
-        [],
-        now=warned_at + timedelta(hours=12, minutes=1),
-    )
-    assert out.action == "needs_scorecard"
-
-
-def test_maintainer_hold_label_prevents_stale_blocking_close():
-    pr = _pr(number=1, head_sha="sha1", body=NO_SCORECARD_BODY)
-    pr.labels = ("status:maintainer-review",)
-    warned_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
-    marker = f"<!-- cco-blocking-change:scorecard:sha1:{warned_at.isoformat()} -->"
-    out = process_pr(
-        pr,
-        SOME_DIFF,
-        [marker],
-        frozenset(),
-        [],
-        now=warned_at + timedelta(hours=12, minutes=1),
-    )
-    assert out.action == "needs_scorecard"
+    assert out.action == "close_missing_scorecard"
 
 
 def test_clean_pr_with_no_runner_is_eval_pending():
@@ -299,11 +264,6 @@ def test_already_queued_helper():
     assert not already_queued(["hello", "world"], "abc")
 
 
-def test_already_notified_helper():
-    assert already_notified(["x", "<!-- cco-needs-scorecard:abc -->"], NEEDS_SCORECARD_MARKER, "abc")
-    assert not already_notified(["x"], NEEDS_SCORECARD_MARKER, "abc")
-
-
 def test_merge_conflict_comment_time_ignores_other_heads_and_picks_latest():
     comments = [
         "<!-- cco-merge-conflict:sha0:2026-07-10T01:00:00+00:00 -->",
@@ -314,14 +274,109 @@ def test_merge_conflict_comment_time_ignores_other_heads_and_picks_latest():
     assert when == datetime(2026, 7, 10, 3, 0, tzinfo=timezone.utc)
 
 
-def test_blocking_change_comment_time_filters_reason_and_head():
-    comments = [
-        "<!-- cco-blocking-change:scorecard:sha0:2026-07-10T01:00:00+00:00 -->",
-        "<!-- cco-blocking-change:pr-kind:sha1:2026-07-10T02:00:00+00:00 -->",
-        "<!-- cco-blocking-change:scorecard:sha1:2026-07-10T03:00:00+00:00 -->",
+def _review(
+    reviewer="maintainer",
+    state="CHANGES_REQUESTED",
+    submitted_at="2026-07-10T08:00:00Z",
+    commit_id="sha1",
+    author_association="MEMBER",
+):
+    return ReviewInfo(
+        reviewer=reviewer,
+        state=state,
+        submitted_at=submitted_at,
+        commit_id=commit_id,
+        author_association=author_association,
+    )
+
+
+def test_latest_maintainer_change_request_uses_latest_review_per_reviewer():
+    reviews = [
+        _review(reviewer="alice", state="CHANGES_REQUESTED", submitted_at="2026-07-10T01:00:00Z"),
+        _review(reviewer="alice", state="APPROVED", submitted_at="2026-07-10T02:00:00Z"),
+        _review(reviewer="bob", state="CHANGES_REQUESTED", submitted_at="2026-07-10T03:00:00Z"),
     ]
-    when = blocking_change_comment_time(comments, "sha1", "scorecard")
-    assert when == datetime(2026, 7, 10, 3, 0, tzinfo=timezone.utc)
+    review = latest_maintainer_change_request(reviews, "sha1")
+    assert review.reviewer == "bob"
+
+
+def test_maintainer_change_request_blocks_current_head():
+    requested_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    out = process_pr(
+        _pr(number=1, head_sha="sha1"),
+        SOME_DIFF,
+        [],
+        frozenset(),
+        [],
+        now=requested_at + timedelta(hours=1),
+        reviews=[_review(submitted_at=requested_at.isoformat(), commit_id="sha1")],
+    )
+    assert out.action == "maintainer_changes_requested"
+    assert out.label == CHANGES_REQUESTED_LABEL
+
+
+def test_stale_maintainer_change_request_closes_after_12_hours():
+    requested_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    out = process_pr(
+        _pr(number=1, head_sha="sha1"),
+        SOME_DIFF,
+        [],
+        frozenset(),
+        [],
+        now=requested_at + timedelta(hours=12, minutes=1),
+        reviews=[_review(submitted_at=requested_at.isoformat(), commit_id="sha1")],
+    )
+    assert out.action == "close_stale_maintainer_changes"
+
+
+def test_maintainer_change_request_resets_after_new_head_sha():
+    requested_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    out = process_pr(
+        _pr(number=1, head_sha="sha2"),
+        SOME_DIFF,
+        [],
+        frozenset(),
+        [],
+        now=requested_at + timedelta(hours=12, minutes=1),
+        reviews=[_review(submitted_at=requested_at.isoformat(), commit_id="sha1")],
+    )
+    assert out.action == "eval_pending"
+
+
+def test_maintainer_hold_label_prevents_stale_review_close():
+    requested_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    pr = _pr(number=1, head_sha="sha1")
+    pr.labels = ("status:maintainer-review",)
+    out = process_pr(
+        pr,
+        SOME_DIFF,
+        [],
+        frozenset(),
+        [],
+        now=requested_at + timedelta(hours=12, minutes=1),
+        reviews=[_review(submitted_at=requested_at.isoformat(), commit_id="sha1")],
+    )
+    assert out.action == "maintainer_changes_requested"
+
+
+def test_non_maintainer_change_request_is_ignored():
+    requested_at = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    out = process_pr(
+        _pr(number=1, head_sha="sha1"),
+        SOME_DIFF,
+        [],
+        frozenset(),
+        [],
+        now=requested_at + timedelta(hours=12, minutes=1),
+        reviews=[
+            _review(
+                submitted_at=requested_at.isoformat(),
+                commit_id="sha1",
+                author_association="CONTRIBUTOR",
+            )
+        ],
+    )
+    assert out.action == "eval_pending"
 
 
 def test_excess_open_prs_keeps_two_oldest_prs_per_author():
@@ -342,11 +397,12 @@ def test_excess_open_prs_ignores_recent_updates_and_closes_newer_prs():
 class FakeClient:
     """In-memory stand-in for GitHubClient -- no subprocess/network calls."""
 
-    def __init__(self, prs, diffs, comments=None, commit_messages=None):
+    def __init__(self, prs, diffs, comments=None, commit_messages=None, reviews=None):
         self._prs = prs               # dict: state -> list[PRInfo]
         self._diffs = diffs           # dict: pr_number -> diff text
         self._comments = comments or {}
         self._commit_messages = commit_messages or {}
+        self._reviews = reviews or {}
         self.actions = []             # records of what WOULD have been written
 
     def list_prs(self, state="open"):
@@ -362,6 +418,9 @@ class FakeClient:
 
     def get_commit_messages(self, pr_number):
         return self._commit_messages.get(pr_number, "")
+
+    def get_reviews(self, pr_number):
+        return self._reviews.get(pr_number, [])
 
     def post_comment(self, pr_number, body):
         self.actions.append(("post_comment", pr_number, body))
@@ -393,43 +452,40 @@ def test_run_once_live_mode_applies_actions():
     pr1 = _pr(number=1, author="badactor", body=SCORECARD_BODY)
     client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: SOME_DIFF})
     # No blocked-contributors.txt in this sandbox -> not blocked; force the
-    # "needs_scorecard" path instead by using a body with no scorecard, so we
-    # can observe a real write action deterministically without touching the
-    # filesystem-backed blocked list.
+    # missing-scorecard close path instead by using a body with no scorecard,
+    # so we can observe a real write action deterministically without touching
+    # the filesystem-backed blocked list.
     pr1.body = NO_SCORECARD_BODY
     outcomes = run_once(client, dry_run=False)
-    assert outcomes[0].action == "needs_scorecard"
-    assert ("add_label", 1, "status:needs-scorecard") in client.actions
-    assert any(a[0] == "post_comment" for a in client.actions)
-
-
-def test_run_once_live_mode_does_not_repeat_needs_scorecard_comment():
-    pr1 = _pr(number=1, author="alice", body=NO_SCORECARD_BODY)
-    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
-    marker = f"<!-- cco-blocking-change:scorecard:sha1:{recent.isoformat()} -->"
-    client = FakeClient(
-        prs={"all": [pr1], "open": [pr1]},
-        diffs={1: SOME_DIFF},
-        comments={1: [marker]},
-    )
-    outcomes = run_once(client, dry_run=False)
-    assert outcomes[0].action == "needs_scorecard"
-    assert ("add_label", 1, "status:needs-scorecard") in client.actions
-    assert not any(a[0] == "post_comment" for a in client.actions)
-
-
-def test_run_once_live_mode_closes_stale_scorecard_request():
-    pr1 = _pr(number=1, author="alice", body=NO_SCORECARD_BODY)
-    stale = (datetime.now(timezone.utc) - timedelta(hours=12, minutes=5)).replace(microsecond=0)
-    marker = f"<!-- cco-blocking-change:scorecard:sha1:{stale.isoformat()} -->"
-    client = FakeClient(
-        prs={"all": [pr1], "open": [pr1]},
-        diffs={1: SOME_DIFF},
-        comments={1: [marker]},
-    )
-    outcomes = run_once(client, dry_run=False)
-    assert outcomes[0].action == "close_stale_blocking_request"
+    assert outcomes[0].action == "close_missing_scorecard"
     assert ("close_pr", 1, outcomes[0].detail) in client.actions
+
+
+def test_run_once_live_mode_closes_stale_maintainer_change_request():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY, head_sha="sha1")
+    stale = (datetime.now(timezone.utc) - timedelta(hours=12, minutes=5)).replace(microsecond=0)
+    client = FakeClient(
+        prs={"all": [pr1], "open": [pr1]},
+        diffs={1: SOME_DIFF},
+        reviews={1: [_review(submitted_at=stale.isoformat(), commit_id="sha1")]},
+    )
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "close_stale_maintainer_changes"
+    assert ("close_pr", 1, outcomes[0].detail) in client.actions
+
+
+def test_run_once_live_mode_labels_active_maintainer_change_request():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY, head_sha="sha1")
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
+    client = FakeClient(
+        prs={"all": [pr1], "open": [pr1]},
+        diffs={1: SOME_DIFF},
+        reviews={1: [_review(submitted_at=recent.isoformat(), commit_id="sha1")]},
+    )
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "maintainer_changes_requested"
+    assert ("add_label", 1, CHANGES_REQUESTED_LABEL) in client.actions
+    assert ("remove_label", 1, GPU_QUEUE_LABEL) in client.actions
 
 
 def test_run_once_live_mode_blocks_coding_agent_coauthor_footer():
@@ -539,12 +595,12 @@ def test_queue_dashboard_only_lists_eval_pending_prs():
     assert [row["pr"] for row in data["queue"]] == [2]
 
 
-def test_run_once_live_mode_labels_protected_path():
+def test_run_once_live_mode_closes_protected_path():
     pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
     client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: PROTECTED_DIFF})
     outcomes = run_once(client, dry_run=False)
-    assert outcomes[0].action == "protected_path"
-    assert ("add_label", 1, PROTECTED_PATH_LABEL) in client.actions
+    assert outcomes[0].action == "close_protected_path"
+    assert ("close_pr", 1, outcomes[0].detail) in client.actions
 
 
 def test_run_once_live_mode_closes_older_prs_when_author_exceeds_cap():

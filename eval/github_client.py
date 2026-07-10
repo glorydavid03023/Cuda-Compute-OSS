@@ -29,6 +29,15 @@ class PRInfo:
     mergeable: str = ""
 
 
+@dataclass
+class ReviewInfo:
+    reviewer: str
+    state: str
+    submitted_at: str
+    commit_id: str = ""
+    author_association: str = ""
+
+
 class GitHubClient:
     def __init__(self, repo: str):
         self.repo = repo
@@ -86,6 +95,26 @@ class GitHubClient:
             body = commit.get("messageBody") or ""
             parts.append(f"{headline}\n{body}".strip())
         return "\n\n".join(part for part in parts if part)
+
+    def get_reviews(self, pr_number: int) -> list[ReviewInfo]:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{self.repo}/pulls/{pr_number}/reviews"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        out = result.stdout
+        data = json.loads(out)
+        return [
+            ReviewInfo(
+                reviewer=(d.get("user") or {}).get("login") or "",
+                state=d.get("state") or "",
+                submitted_at=d.get("submitted_at") or "",
+                commit_id=d.get("commit_id") or "",
+                author_association=d.get("author_association") or "",
+            )
+            for d in data
+        ]
 
     def post_comment(self, pr_number: int, body: str) -> None:
         subprocess.run(["gh", "pr", "comment", str(pr_number), "-R", self.repo,

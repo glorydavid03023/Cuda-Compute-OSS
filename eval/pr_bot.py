@@ -30,26 +30,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import copycat_guard
-from .github_client import GitHubClient, PRInfo
+from .github_client import GitHubClient, PRInfo, ReviewInfo
 
 REPO_DEFAULT = "zeokin/Cuda-Compute-OSS"
 BLOCKED_CONTRIBUTORS_PATH = ".github/blocked-contributors.txt"
 IDEMPOTENCY_MARKER = "<!-- cco-eval:{sha} -->"
-NEEDS_SCORECARD_MARKER = "<!-- cco-needs-scorecard:{sha} -->"
-NEEDS_PR_KIND_MARKER = "<!-- cco-needs-pr-kind:{sha} -->"
 MERGE_CONFLICT_MARKER_RE = re.compile(
     r"<!--\s*cco-merge-conflict:(?P<sha>[0-9A-Za-z._-]+):(?P<ts>[^ >]+)\s*-->"
-)
-BLOCKING_CHANGE_MARKER_RE = re.compile(
-    r"<!--\s*cco-blocking-change:"
-    r"(?P<reason>[0-9A-Za-z._-]+):(?P<sha>[0-9A-Za-z._-]+):(?P<ts>[^ >]+)\s*-->"
 )
 RESULT_MARKER_PREFIX = "<!-- cco-result:{pr}:"
 GPU_QUEUE_LABEL = "status:queued-gpu"
 GPU_QUEUE_READY_ACTIONS = frozenset({"eval_pending"})
 READY_NON_GPU_LABEL = "status:ready-non-gpu"
 NEEDS_PR_KIND_LABEL = "status:needs-pr-kind"
-PROTECTED_PATH_LABEL = "status:protected-path"
+CHANGES_REQUESTED_LABEL = "status:changes-requested"
 MAX_OPEN_PRS_PER_AUTHOR = 2
 MERGE_CONFLICT_GRACE = timedelta(hours=12)
 BLOCKING_CHANGE_GRACE = timedelta(hours=12)
@@ -98,6 +92,9 @@ CODING_AGENT_COAUTHOR_RE = re.compile(
     r"(cursor|codex|claude|copilot|openai|anthropic|aider|windsurf|devin|"
     r"codeium|tabnine|qodo|amazon\s*q|coding[- ]?agent|ai[- ]?agent)",
 )
+MAINTAINER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+BLOCKING_REVIEW_STATES = frozenset({"CHANGES_REQUESTED"})
+CLEARING_REVIEW_STATES = frozenset({"APPROVED", "DISMISSED"})
 
 
 @dataclass
@@ -125,11 +122,6 @@ def already_queued(comments: list, head_sha: str) -> bool:
     return any(marker in c for c in comments)
 
 
-def already_notified(comments: list, marker: str, head_sha: str) -> bool:
-    tagged = marker.format(sha=head_sha)
-    return any(tagged in c for c in comments)
-
-
 def already_evaluated(pr_number: int, comments: list) -> bool:
     marker = RESULT_MARKER_PREFIX.format(pr=pr_number)
     return any(marker in c for c in comments)
@@ -154,62 +146,50 @@ def merge_conflict_comment_time(comments: list, head_sha: str) -> datetime | Non
     return latest
 
 
-def blocking_change_comment_time(
-    comments: list,
-    head_sha: str,
-    reason: str | None = None,
-) -> datetime | None:
-    """Latest bot blocking-change request for this exact head SHA."""
-    latest = None
-    for body in comments:
-        for match in BLOCKING_CHANGE_MARKER_RE.finditer(body or ""):
-            if match.group("sha") != head_sha:
-                continue
-            if reason is not None and match.group("reason") != reason:
-                continue
-            try:
-                when = _parse_iso8601(match.group("ts"))
-            except ValueError:
-                continue
-            if latest is None or when > latest:
-                latest = when
-    return latest
-
-
 def has_maintainer_hold(pr: PRInfo) -> bool:
     """True when a maintainer label explicitly disables stale auto-close."""
     labels = {label.lower() for label in pr.labels}
     return bool(labels & MAINTAINER_HOLD_LABELS)
 
 
-def _blocking_request_outcome(
-    pr: PRInfo,
-    comments: list,
-    *,
-    reason: str,
-    active_action: str,
-    active_detail: str,
-    label: str | None,
-    kind: str | None = None,
-    close_detail: str,
-    now: datetime,
-) -> GateOutcome:
-    """Return the active blocking request or stale-close outcome.
+def latest_maintainer_change_request(
+    reviews: list[ReviewInfo],
+    head_sha: str,
+) -> ReviewInfo | None:
+    """Return the latest active maintainer CHANGES_REQUESTED review for head."""
+    latest_by_reviewer: dict[str, ReviewInfo] = {}
+    sortable_reviews = []
+    for review in reviews:
+        try:
+            when = _parse_iso8601(review.submitted_at)
+        except ValueError:
+            continue
+        sortable_reviews.append((when, review))
 
-    The timer is keyed to the PR's current head SHA. Any new commit changes the
-    SHA, so the next bot run posts a fresh request and restarts the 12-hour
-    window without any external state.
-    """
-    warned_at = blocking_change_comment_time(comments, pr.head_sha, reason)
-    if warned_at is not None and not has_maintainer_hold(pr):
-        if now - warned_at >= BLOCKING_CHANGE_GRACE:
-            return GateOutcome(
-                pr.number,
-                "close_stale_blocking_request",
-                detail=close_detail,
-                kind=kind,
-            )
-    return GateOutcome(pr.number, active_action, detail=active_detail, label=label, kind=kind)
+    for _, review in sorted(sortable_reviews, key=lambda item: item[0]):
+        reviewer = review.reviewer
+        if not reviewer:
+            continue
+        if (review.author_association or "").upper() not in MAINTAINER_ASSOCIATIONS:
+            continue
+        state = (review.state or "").upper()
+        if state not in BLOCKING_REVIEW_STATES | CLEARING_REVIEW_STATES:
+            continue
+        if review.commit_id and review.commit_id != head_sha:
+            continue
+        latest_by_reviewer[reviewer] = review
+
+    active = [
+        review for review in latest_by_reviewer.values()
+        if (review.state or "").upper() in BLOCKING_REVIEW_STATES and review.submitted_at
+    ]
+    if not active:
+        return None
+
+    def submitted_at(review: ReviewInfo) -> datetime:
+        return _parse_iso8601(review.submitted_at)
+
+    return max(active, key=submitted_at)
 
 
 def has_merge_conflict(pr: PRInfo) -> bool:
@@ -348,6 +328,7 @@ def process_pr(
     commit_messages: str = "",
     now: datetime | None = None,
     run_eval=None,
+    reviews: list[ReviewInfo] | None = None,
 ) -> GateOutcome:
     """Decide the gate-chain outcome for one PR. Pure: takes already-fetched
     data, performs no GitHub I/O, so it's fully unit-testable.
@@ -360,11 +341,13 @@ def process_pr(
 
     action values: skip_draft, close_blocked, close_excess_open_pr,
     needs_merge_conflict_resolution, close_stale_merge_conflict,
-    close_coding_agent_coauthor, close_stale_blocking_request, copycat_block,
-    copycat_warn, already_evaluated, needs_pr_kind, needs_scorecard,
-    non_gpu_review, eval_pending, evaluated.
+    close_coding_agent_coauthor, close_protected_path, close_missing_pr_kind,
+    close_missing_scorecard, maintainer_changes_requested,
+    close_stale_maintainer_changes, copycat_block, copycat_warn,
+    already_evaluated, non_gpu_review, eval_pending, evaluated.
     """
     now = now or datetime.now(timezone.utc)
+    reviews = reviews or []
 
     if pr.is_draft:
         return GateOutcome(pr.number, "skip_draft")
@@ -390,6 +373,29 @@ def process_pr(
                    "CCO does not accept coding-agent co-author footers.",
         )
 
+    change_request = latest_maintainer_change_request(reviews, pr.head_sha)
+    if change_request is not None:
+        requested_at = _parse_iso8601(change_request.submitted_at)
+        if not has_maintainer_hold(pr) and now - requested_at >= BLOCKING_CHANGE_GRACE:
+            return GateOutcome(
+                pr.number,
+                "close_stale_maintainer_changes",
+                detail=(
+                    "Closing this PR because maintainer-requested changes were not "
+                    "addressed with a new commit within 12 hours."
+                ),
+            )
+        return GateOutcome(
+            pr.number,
+            "maintainer_changes_requested",
+            detail=(
+                f"Maintainer {change_request.reviewer} requested changes on the "
+                "current head SHA. Push a new commit within 12 hours or the bot "
+                "will close the PR automatically."
+            ),
+            label=CHANGES_REQUESTED_LABEL,
+        )
+
     if has_merge_conflict(pr):
         warned_at = merge_conflict_comment_time(comments, pr.head_sha)
         if warned_at is None:
@@ -399,7 +405,7 @@ def process_pr(
                 detail="This PR has merge conflicts with the base branch. Resolve them within "
                        "12 hours or the bot will close the PR automatically.",
             )
-        if now - warned_at >= MERGE_CONFLICT_GRACE:
+        if not has_maintainer_hold(pr) and now - warned_at >= MERGE_CONFLICT_GRACE:
             return GateOutcome(
                 pr.number,
                 "close_stale_merge_conflict",
@@ -416,19 +422,11 @@ def process_pr(
     protected = protected_paths(diff_text)
     if protected:
         detail = "PR touches maintainer-owned files: " + ", ".join(protected)
-        return _blocking_request_outcome(
-            pr,
-            comments,
-            reason="protected-path",
-            active_action="protected_path",
-            active_detail=detail,
-            label=PROTECTED_PATH_LABEL,
-            close_detail=(
-                "Closing this PR because the requested protected-path split was not "
-                "fixed within 12 hours of the bot reminder. Open a fresh PR after "
-                "removing maintainer-owned files."
-            ),
-            now=now,
+        return GateOutcome(
+            pr.number,
+            "close_protected_path",
+            detail=detail + ". Miner PRs cannot modify maintainer-owned files. "
+                    "Open a fresh PR that only changes allowed miner-owned files.",
         )
 
     kind = classify_pr(pr, diff_text)
@@ -445,23 +443,14 @@ def process_pr(
                            label="copycat-warn", kind=kind)
 
     if kind == "unknown":
-        return _blocking_request_outcome(
-            pr,
-            comments,
-            reason="pr-kind",
-            active_action="needs_pr_kind",
-            active_detail=(
-                "Declare this PR as either fix/bug or feat/strategy in the title "
-                "or PR template so automation can route it correctly."
+        return GateOutcome(
+            pr.number,
+            "close_missing_pr_kind",
+            detail=(
+                "Closing this PR because it does not declare a PR kind. Open a fresh "
+                "PR with either fix/bug or feat/strategy in the title or PR template."
             ),
-            label=NEEDS_PR_KIND_LABEL,
             kind=kind,
-            close_detail=(
-                "Closing this PR because the requested PR-kind declaration was not "
-                "fixed within 12 hours of the bot reminder. Open a fresh PR with a "
-                "clear fix/bug or feat/strategy lane."
-            ),
-            now=now,
         )
 
     if already_evaluated(pr.number, comments):
@@ -477,20 +466,14 @@ def process_pr(
         )
 
     if not has_scorecard(pr.body):
-        return _blocking_request_outcome(
-            pr,
-            comments,
-            reason="scorecard",
-            active_action="needs_scorecard",
-            active_detail="PR body is missing a filled-in scorecard (see CONTRIBUTING.md)",
-            label="status:needs-scorecard",
-            kind=kind,
-            close_detail=(
-                "Closing this PR because the requested scorecard was not added within "
-                "12 hours of the bot reminder. Open a fresh feat/strategy PR with a "
-                "filled-in scorecard."
+        return GateOutcome(
+            pr.number,
+            "close_missing_scorecard",
+            detail=(
+                "Closing this feat/strategy PR because it is missing a filled-in "
+                "scorecard. Open a fresh PR with reproducible eval results."
             ),
-            now=now,
+            kind=kind,
         )
 
     if run_eval is None:
@@ -524,12 +507,25 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome, comments: lis
         client.remove_label(pr.number, READY_NON_GPU_LABEL)
         client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
         client.remove_label(pr.number, "status:needs-scorecard")
+        client.remove_label(pr.number, CHANGES_REQUESTED_LABEL)
     elif outcome.action == "close_stale_merge_conflict":
         client.close_pr(pr.number, outcome.detail)
     elif outcome.action == "close_coding_agent_coauthor":
         client.close_pr(pr.number, outcome.detail)
-    elif outcome.action == "close_stale_blocking_request":
+    elif outcome.action == "close_protected_path":
         client.close_pr(pr.number, outcome.detail)
+    elif outcome.action == "close_missing_pr_kind":
+        client.close_pr(pr.number, outcome.detail)
+    elif outcome.action == "close_missing_scorecard":
+        client.close_pr(pr.number, outcome.detail)
+    elif outcome.action == "close_stale_maintainer_changes":
+        client.close_pr(pr.number, outcome.detail)
+    elif outcome.action == "maintainer_changes_requested":
+        client.add_label(pr.number, CHANGES_REQUESTED_LABEL)
+        client.remove_label(pr.number, GPU_QUEUE_LABEL)
+        client.remove_label(pr.number, READY_NON_GPU_LABEL)
+        client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
+        client.remove_label(pr.number, "status:needs-scorecard")
     elif outcome.action == "copycat_block":
         client.add_label(pr.number, "copycat")
         client.post_comment(pr.number, f"Closed as a copycat submission: {outcome.detail}")
@@ -537,63 +533,17 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome, comments: lis
     elif outcome.action == "copycat_warn":
         client.add_label(pr.number, "copycat-warn")
         client.post_comment(pr.number, f"Flagged for maintainer review: {outcome.detail}")
-    elif outcome.action == "needs_pr_kind":
-        client.add_label(pr.number, NEEDS_PR_KIND_LABEL)
-        client.remove_label(pr.number, GPU_QUEUE_LABEL)
-        client.remove_label(pr.number, "status:needs-scorecard")
-        client.remove_label(pr.number, READY_NON_GPU_LABEL)
-        if blocking_change_comment_time(comments, pr.head_sha, "pr-kind") is None:
-            stamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-            client.post_comment(
-                pr.number,
-                f"<!-- cco-blocking-change:pr-kind:{pr.head_sha}:{stamp} -->\n"
-                + NEEDS_PR_KIND_MARKER.format(sha=pr.head_sha)
-                + "\nPlease mark this PR as either `fix`/`bug` or "
-                  "`feat`/`strategy` in the title or PR template. "
-                  "If this same head SHA is not updated within 12 hours, "
-                  "the bot will close the PR automatically.",
-            )
-    elif outcome.action == "needs_scorecard":
-        client.add_label(pr.number, "status:needs-scorecard")
-        client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
-        client.remove_label(pr.number, GPU_QUEUE_LABEL)
-        client.remove_label(pr.number, READY_NON_GPU_LABEL)
-        if blocking_change_comment_time(comments, pr.head_sha, "scorecard") is None:
-            stamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-            client.post_comment(
-                pr.number,
-                f"<!-- cco-blocking-change:scorecard:{pr.head_sha}:{stamp} -->\n"
-                + NEEDS_SCORECARD_MARKER.format(sha=pr.head_sha)
-                + "\nPlease add a filled-in scorecard from "
-                  "`python -m eval` (see CONTRIBUTING.md). "
-                  "If this same head SHA is not updated within 12 hours, "
-                  "the bot will close the PR automatically.",
-            )
-    elif outcome.action == "protected_path":
-        client.add_label(pr.number, PROTECTED_PATH_LABEL)
-        client.remove_label(pr.number, READY_NON_GPU_LABEL)
-        client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
-        client.remove_label(pr.number, "status:needs-scorecard")
-        client.remove_label(pr.number, GPU_QUEUE_LABEL)
-        if blocking_change_comment_time(comments, pr.head_sha, "protected-path") is None:
-            stamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-            client.post_comment(
-                pr.number,
-                f"<!-- cco-blocking-change:protected-path:{pr.head_sha}:{stamp} -->\n"
-                "This PR touches maintainer-owned files and will not enter the GPU "
-                f"queue: {outcome.detail}. Split miner submissions so scoring "
-                "changes stay outside protected paths. If this same head SHA is not "
-                "updated within 12 hours, the bot will close the PR automatically.",
-            )
     elif outcome.action == "non_gpu_review":
         client.add_label(pr.number, READY_NON_GPU_LABEL)
         client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
         client.remove_label(pr.number, "status:needs-scorecard")
         client.remove_label(pr.number, GPU_QUEUE_LABEL)
+        client.remove_label(pr.number, CHANGES_REQUESTED_LABEL)
     elif outcome.action == "eval_pending":
         client.remove_label(pr.number, "status:needs-scorecard")
         client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
         client.remove_label(pr.number, READY_NON_GPU_LABEL)
+        client.remove_label(pr.number, CHANGES_REQUESTED_LABEL)
         client.add_label(pr.number, GPU_QUEUE_LABEL)
         if not already_queued(comments, pr.head_sha):
             client.post_comment(
@@ -607,6 +557,7 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome, comments: lis
         client.remove_label(pr.number, NEEDS_PR_KIND_LABEL)
         client.remove_label(pr.number, READY_NON_GPU_LABEL)
         client.remove_label(pr.number, GPU_QUEUE_LABEL)
+        client.remove_label(pr.number, CHANGES_REQUESTED_LABEL)
     # skip_draft / evaluated: nothing to write here.
     # ("evaluated" posts its own scorecard comment from within run_eval /
     # eval.runner once Phase 2 wires that in -- not this function's job.)
@@ -704,10 +655,14 @@ def run_once(
     diff_by_pr = {}
     fp_by_pr = {}
     commit_messages_by_pr = {}
+    reviews_by_pr = {}
     for p in all_prs:
         diff_by_pr[p.number] = client.get_diff(p.number)
         fp_by_pr[p.number] = copycat_guard.fingerprint(diff_by_pr[p.number])
         commit_messages_by_pr[p.number] = client.get_commit_messages(p.number)
+
+    for p in open_prs:
+        reviews_by_pr[p.number] = client.get_reviews(p.number)
 
     outcomes = []
     for pr in open_prs:
@@ -726,6 +681,7 @@ def run_once(
             commit_messages_by_pr.get(pr.number, ""),
             now,
             run_eval,
+            reviews=reviews_by_pr.get(pr.number, []),
         )
         outcomes.append(outcome)
 
