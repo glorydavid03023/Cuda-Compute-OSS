@@ -96,11 +96,15 @@ def stream_gemm_left_t(X, Q, backend: Backend, dtype,
     xp = backend.xp
     n, m = X.shape[0], Q.shape[1]
     acc = xp.zeros((n, m), dtype=dtype)
-    # matmul(Xr.T, Q[rb]) is (n, m) regardless of the block size, so it is a
-    # fixed per-iteration cost rather than a per-row one.
+    # Two (n, m) buffers are live at the peak of each step and neither scales with
+    # the block: the resident accumulator ``acc`` and the ``matmul(Xr.T, Q[rb])``
+    # product, which cannot alias ``acc`` and coexists with it during ``acc += ...``.
+    # Charge both up front (2*n*m) -- counting only the product (n*m) leaves the
+    # accumulator unbudgeted and sizes the block against the whole budget, risking
+    # OOM (cf. #138 and stream_gemm_right's resident output).
     item = np.dtype(dtype).itemsize
     blk = _row_block(n, X.shape[1], backend, item, frac,
-                     fixed_bytes=n * m * item)
+                     fixed_bytes=2 * n * m * item)
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
