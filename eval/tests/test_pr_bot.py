@@ -783,6 +783,21 @@ def test_queue_record_carries_declared_track():
     assert _queue_record(pr2, GateOutcome(8, "eval_pending", kind="feat"))["track"] is None
 
 
+def test_declared_transform_parses_and_ignores_placeholder():
+    from eval.pr_bot import declared_transform
+    assert declared_transform("**Transform:** `nystrom`") == "nystrom"
+    assert declared_transform("**transform:** dct") == "dct"
+    assert declared_transform("**Transform:** `____`") is None    # unfilled placeholder
+    assert declared_transform("no transform field here") is None
+
+
+def test_queue_record_carries_declared_transform():
+    from eval.pr_bot import _queue_record, GateOutcome
+    pr = _pr(number=9, body="**Transform:** `nystrom`\n" + SCORECARD_BODY)
+    rec = _queue_record(pr, GateOutcome(9, "eval_pending", kind="feat"))
+    assert rec["transform"] == "nystrom"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

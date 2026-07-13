@@ -97,6 +97,8 @@ jobs:
             --limit "$LIMIT"
             --n "$N"
             --pairs "$PAIRS"
+            --runs 5
+            --sweep 2048,4096,8192
             --run
             --clean
           )

@@ -45,6 +45,14 @@ context, not the verdict — you cannot pick the rank/M that flatters your metho
 and the baseline is always the current frontier, never the rsvd on your branch.
 -->
 
+**Transform:** `____`
+
+<!--
+The transform your PR adds or changes (the name in `register_transform("…")`),
+e.g. `nystrom`. The bot scores THIS transform, and verifies your diff actually
+adds or modifies it — you cannot claim credit for a transform you did not write.
+-->
+
 ## GPU Result (required for feat PRs only)
 
 | metric          | value          |

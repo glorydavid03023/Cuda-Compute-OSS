@@ -36,6 +36,7 @@ class QueueItem:
     position: int | None = None
     url: str = ""
     track: str | None = None      # declared track -> pinned regime (eval.tracks)
+    transform: str | None = None  # declared candidate transform (verified vs the diff)
 
 
 def spec_for_track(spec: EvalSpec, track: str | None) -> "EvalSpec":
@@ -119,6 +120,7 @@ def load_queue(path: str | Path) -> list[QueueItem]:
                 position=raw.get("position"),
                 url=raw.get("url", ""),
                 track=raw.get("track"),
+                transform=raw.get("transform"),
             )
         )
     return sorted(items, key=lambda item: item.position or item.pr)
@@ -278,6 +280,19 @@ def _rebase_onto_main(checkout: Path) -> bool:
     return True
 
 
+def _transform_touched(checkout: Path, name: str) -> bool:
+    """True if the PR's changes vs origin/main add or modify the transform
+    ``name`` in strategy/transforms.py -- so a PR can't claim credit for a
+    transform it did not write. (Run after the rebase, so origin/main...HEAD is
+    exactly the PR's commits.)"""
+    diff = subprocess.run(
+        ["git", "diff", "origin/main...HEAD", "--", "strategy/transforms.py"],
+        cwd=checkout, text=True, capture_output=True).stdout
+    changed = "\n".join(l for l in diff.splitlines()
+                        if l[:1] in "+-" and not l.startswith(("+++", "---")))
+    return name in changed
+
+
 def run_item(
     item: QueueItem,
     *,
@@ -333,6 +348,19 @@ def run_item(
         }, indent=2) + "\n", encoding="utf-8")
         return result
 
+    # Verify + pin the candidate: score ONLY the transform this PR actually wrote.
+    if item.transform:
+        if not _transform_touched(checkout, item.transform):
+            result.write_text(json.dumps({
+                "pr": item.pr, "title": item.title, "author": item.author,
+                "head_sha": item.head_sha, "url": item.url, "mock": False,
+                "state": "unverified_transform",
+                "detail": f"declared transform {item.transform!r} is not added or "
+                          "modified by this PR's diff to strategy/transforms.py",
+            }, indent=2) + "\n", encoding="utf-8")
+            return result
+        spec = replace(spec, transforms=item.transform)
+
     _run(["uv", "sync", "--extra", "test", "--extra", "gpu"], cwd=checkout)
     _run("uv run --extra test python -m py_compile $(find matmul strategy eval tests examples -name '*.py')",
          cwd=checkout)
@@ -359,7 +387,7 @@ def run_item(
     wrapped = {
         "pr": item.pr, "title": item.title, "author": item.author,
         "head_sha": item.head_sha, "url": item.url, "mock": False,
-        "track": item.track, "eval": aggregate,
+        "track": item.track, "transform": item.transform, "eval": aggregate,
     }
     result.write_text(json.dumps(wrapped, indent=2) + "\n", encoding="utf-8")
     return result
