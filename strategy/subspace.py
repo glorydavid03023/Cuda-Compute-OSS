@@ -78,10 +78,16 @@ def stream_gemm_right(X, Q, backend: Backend, dtype,
     """Return X @ Q  (n x m), streaming the rows of X. Q is resident (n x m)."""
     xp = backend.xp
     n, m = X.shape[0], Q.shape[1]
+    item = np.dtype(dtype).itemsize
     out = xp.empty((n, m), dtype=dtype)
-    # each block also allocates matmul(Xr, Q) -> (blk, m): m output cols per row.
-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac,
-                     out_cols=m)
+    # `out` is a full (n, m) device buffer resident for the whole loop, so it is a
+    # fixed cost that does not scale with the block -- charge it up front, exactly
+    # as stream_gemm_left_t does for its (n, m) accumulator. Omitting it sizes the
+    # block against the whole budget and under-counts device use by n*m (up to the
+    # entire budget at M = N), risking OOM. Each block also allocates
+    # matmul(Xr, Q) -> (blk, m): m output cols per staged row.
+    blk = _row_block(n, X.shape[1], backend, item, frac,
+                     out_cols=m, fixed_bytes=n * m * item)
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
