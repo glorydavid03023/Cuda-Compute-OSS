@@ -142,9 +142,11 @@ itself verified.
 
 The fast way to a good score is usually a lie. These are rejected on sight:
 
-- **No accuracy laundering.** You cannot buy latency/VRAM with accuracy. An
-  improvement requires cost to drop while accuracy holds — see the dominance
-  rule in [BENCHMARKS.md](BENCHMARKS.md).
+- **No accuracy laundering.** You cannot drop **below your track's accuracy
+  floor** to buy latency/VRAM and call it a win — below the floor gates the score
+  to `0`. Above the floor a cheaper method *is* a real improvement, discounted by
+  how much accuracy it trades away (the composite score) — see the rule in
+  [BENCHMARKS.md](BENCHMARKS.md).
 - **No teaching to the test.** No hardcoding, caching, or looking up the
   evaluation matrices, seeds, or products. A strategy must work on unseen
   couples drawn from the same distribution.

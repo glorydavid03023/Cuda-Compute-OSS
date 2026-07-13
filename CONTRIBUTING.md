@@ -27,23 +27,32 @@ relationship should be understandable from GitHub alone:
 
 ## The one rule
 
-> **You may only claim an improvement when every cost axis goes down and accuracy
-> does not.**
+> **You may only claim an improvement when every cost axis is cheaper than exact
+> and your accuracy stays above your track's floor.**
 
 Cost is `time complexity`, `latency`, and `VRAM usage`. Accuracy is the bounded
-Frobenius score. A change that makes the multiply faster or smaller **by making
-it less accurate is not an improvement** — it is a different, worse answer, and
-CCO scores it as one (often `0`, via the accuracy floor).
+Frobenius score against the exact product. **Exact matmul is accuracy `1.0`** —
+the ground truth — but it is the *expensive* `O(N³)` baseline you are beating on
+cost. Every approximate strategy is below `1.0` by design, so **"holding
+accuracy" means staying at or above your track's floor** (full-rank `0.80`,
+low-rank `0.95`, decaying-spectrum `0.90`), **not** matching exact. A change that
+drops **below the floor** to run faster or smaller is not an improvement — it is
+a different, worse answer, scored `0` (`eval:REJECT`).
 
-Concretely, a submission is admitted as an improvement only if, against the
-current frontier on the **same inputs**:
+Concretely, a submission is **admitted** only if, on the **same inputs**:
 
-- error (`1 − accuracy`) does **not** increase, **and**
-- `latency`, `VRAM`, and the empirical time-complexity exponent **all** decrease.
+- `latency`, `VRAM`, and FLOPs are **each strictly cheaper than exact** — no
+  averaging one cost axis against another; every axis must beat exact — **and**
+- accuracy **stays at or above the track's floor**.
 
-If any cost axis regresses, or accuracy drops, it is not an improvement. No
-exceptions, no averaging a loss on one axis against a win on another. See
-[BENCHMARKS.md](BENCHMARKS.md) for the precise dominance rule.
+Admitted strategies are ranked by the composite score
+`accuracy × (1/VRAM) × (1/latency)`. So a cheaper method that gives up a *little*
+accuracy is a genuine win, while one that sacrifices *a lot* of accuracy for a
+small cost gain scores lower — the accuracy factor discounts exactly what you
+traded away, and the floor stops egregious trades. A scoring **tier**
+(`eval:S/M/L`) is awarded only for a verified improvement in that score over the
+**current frontier** on the track; matching or re-deriving the frontier scores
+`eval:none`. See [BENCHMARKS.md](BENCHMARKS.md) for the precise rule.
 
 Everything else in this file is just how to *demonstrate* that you followed the
 one rule.

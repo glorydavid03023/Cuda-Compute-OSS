@@ -79,20 +79,25 @@ must be measured on the target GPU and pasted in.
 
 ### The improvement rule
 
-> A suggested method is admitted as an **improvement** over the general method
-> only when, on the same regime, **all** of these hold at once:
+> A suggested method is admitted as an **improvement** over the general (exact)
+> method only when, on the same regime, **all** of these hold at once:
 >
-> - error (`1 − accuracy`) does **not** increase, **and**
-> - time complexity **reduces**, **and**
-> - latency **reduces**, **and**
-> - VRAM usage **reduces**.
+> - time complexity **reduces** versus exact, **and**
+> - latency **reduces** versus exact, **and**
+> - VRAM usage **reduces** versus exact, **and**
+> - accuracy **stays at or above the track's floor**.
 >
-> If *every* item reduces (with accuracy held), we admit the improvement. If any
-> one regresses, we do **not** — no averaging a win on one axis against a loss on
-> another.
+> Every cost axis must beat exact — no averaging a win on one axis against a loss
+> on another. **Exact matmul is accuracy `1.0`** (the ground truth), so an
+> approximate method is *always* below it: "accuracy held" means **above the
+> floor**, not equal to exact. Dropping below the floor gates the score to `0`
+> regardless of how cheap the method is.
 
-We express accuracy as **error** (`1 − accuracy`) precisely so all four axes read
-"lower is better" and the rule is a clean dominance check.
+The cost axes are a strict dominance check against exact; accuracy is a **floor
+gate** (per-track: full-rank `0.80`, low-rank `0.95`, decaying-spectrum `0.90`).
+Admitted methods are then ranked by the composite score `accuracy × (1/VRAM) ×
+(1/latency)`, so a cheaper method that gives up a little accuracy still wins,
+while trading away a lot of accuracy for a small cost gain scores lower.
 
 **Reading the verdict — full-rank is hard on purpose.** On full-rank `8192` data
 a subspace of `M ≪ N` cannot represent the product: the error is ~100%, accuracy
