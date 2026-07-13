@@ -14,7 +14,7 @@ on:
       n:
         description: "Matrix edge N"
         required: true
-        default: "12000"
+        default: "8192"
       pairs:
         description: "Random couples per PR"
         required: true

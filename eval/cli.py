@@ -19,7 +19,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
         description="Score the smart (subspace) strategy vs normal (exact) "
                     "computing: accuracy, latency, peak VRAM -> composite score.",
     )
-    p.add_argument("--n", type=int, default=12000, help="matrix edge N (N x N). default 12000")
+    p.add_argument("--n", type=int, default=8192, help="matrix edge N (N x N). default 8192")
     p.add_argument("--pairs", type=int, default=3,
                    help="number of random couples to average over. default 3")
     p.add_argument("--dtype", choices=("fp16", "fp32", "fp64"), default="fp32")

@@ -182,23 +182,23 @@ couples, multiplies them with the **normal (exact)** engine and your **smart**
 strategy on the *identical* inputs, and prints one scorecard.
 
 CCO computes on a **GPU** (CUDA/MPS) via PyTorch — score on a GPU machine
-(reference: RTX 5090). The reference regime is **`12000`, full-rank**
+(reference: RTX 5090). The reference regime is **`8192`, full-rank**
 (random) data, which is `eval`'s default.
 
 ```bash
-# score your transform on the reference regime (12000, full-rank, 3 couples)
+# score your transform on the reference regime (8192, full-rank, 3 couples)
 uv sync --extra test --extra gpu
-uv run python -m eval --n 12000 --pairs 3 --transforms mine,rsvd
+uv run python -m eval --n 8192 --pairs 3 --transforms mine,rsvd
 
 # fit the empirical time complexity O(N^p); pass --rank-m to hold M fixed (~N²),
 # omit it to let M = min(N, max(64, N//8)) grow with N (~N³)
 uv run python -m eval --transforms mine --rank-m 128 --sweep 512,1024,2048
 
 # machine-readable, for pasting exact numbers
-uv run python -m eval --n 12000 --pairs 3 --transforms mine --json
+uv run python -m eval --n 8192 --pairs 3 --transforms mine --json
 
 # if your strategy targets compressible data, show that regime too (and say so):
-uv run python -m eval --n 12000 --pairs 3 --fill lowrank --data-rank 16 --transforms mine
+uv run python -m eval --n 8192 --pairs 3 --fill lowrank --data-rank 16 --transforms mine
 ```
 
 > **Installing GPU PyTorch — read this if `torch.cuda.is_available()` is `False`.**
@@ -296,7 +296,7 @@ For `feat` PRs, include the scorecard:
 
 <what the strategy does, why it is cheaper, and the regime it targets>
 
-## GPU Result   (N=12000, full-rank, RTX 5090, fp32)
+## GPU Result   (N=8192, full-rank, RTX 5090, fp32)
 
 | metric          | value          |
 |-----------------|----------------|

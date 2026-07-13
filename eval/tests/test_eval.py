@@ -106,7 +106,7 @@ def test_default_rank_m_matches_strategy_floor():
     # Strategy floors M at 64; eval must report the same default, not bare N//8.
     assert default_rank_m(256) == 64
     assert default_rank_m(256) != 256 // 8
-    assert default_rank_m(12000) == 1500
+    assert default_rank_m(8192) == 1024
     assert default_rank_m(32) == 32
 
 

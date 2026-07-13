@@ -59,7 +59,7 @@ class EvalConfig:
     verbose      : print the report.
     """
 
-    n: int = 12000
+    n: int = 8192
     pairs: int = 3
     dtype: str = "fp32"
     rank_m: int | None = None

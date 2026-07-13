@@ -36,7 +36,7 @@ class QueueItem:
 
 @dataclass(frozen=True)
 class EvalSpec:
-    n: int = 12000
+    n: int = 8192
     pairs: int = 3
     dtype: str = "fp32"
     rank_m: int | None = None
@@ -271,7 +271,7 @@ def main(argv=None) -> int:
                         help="with --run, write mock RTX 5090 result JSON without gh/GPU")
     parser.add_argument("--clean", action="store_true",
                         help="replace existing per-PR checkout directories")
-    parser.add_argument("--n", type=int, default=12000)
+    parser.add_argument("--n", type=int, default=8192)
     parser.add_argument("--pairs", type=int, default=3)
     parser.add_argument("--dtype", choices=("fp16", "fp32", "fp64"), default="fp32")
     parser.add_argument("--rank-m", type=int, default=None)
